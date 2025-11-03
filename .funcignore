@@ -1,0 +1,44 @@
+# Ignore Git internals
+.git
+.gitignore
+.gitattributes
+
+# Local settings and secrets
+local.settings.json
+.env
+.env.*
+
+# Local dev tools / IDEs
+.vscode/
+.idea/
+
+# Test artifacts
+.pytest_cache/
+tests/
+test_*.py
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Data and outputs
+dados/
+jsonl/
+output/
+downloads/
+azurite_data/
+__blobstorage__/
+
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+
+# Logs and temp
+*.log
+tmp/

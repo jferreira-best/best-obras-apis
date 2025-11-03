@@ -1,0 +1,77 @@
+# Bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python virtual envs
+.venv/
+venv/
+env/
+ENV/
+.python-env/
+.python_packages/
+
+# Packaging / build artefacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Azure Functions python artifacts
+.python_packages/
+.python_packages_local/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / editor
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Logs
+*.log
+
+# Secrets / local settings (NÃO COMMITAR)
+local.settings.json
+.env
+.env.* 
+azure_credentials.json
+credentials.json
+
+# Azure / tooling / caches
+.azure/
+.azurite/
+azurite_data/
+__blobstorage__/
+
+# Data / generated outputs (não devem ir para repositório)
+dados/
+jsonl/
+jsonl_output/
+output/
+downloads/
+tmp/
+cache/
+*.sqlite
+*.db
+*.ndjson
+*.parquet
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Git
+*.patch
+
+# Other common
+node_modules/
+npm-debug.log*
+yarn-error.log*
