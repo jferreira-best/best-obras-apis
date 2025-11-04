@@ -1,0 +1,15 @@
+{
+  "version": "2.0",
+  "extensionBundle": {
+    "id": "Microsoft.Azure.Functions.ExtensionBundle",
+    "version": "[4.26.2, 4.26.2]",
+    "sourceUri": "https://api.nuget.org/v3/index.json",
+    "downloadPath": "C:\\azfunc_bundles"
+  },
+  "aggregator": {
+    "batchSize": 100,
+    "flushTimeout": "00:00:30"
+  }
+}
+
+

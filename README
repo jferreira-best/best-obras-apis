@@ -1,0 +1,204 @@
+# Azure Function + Semantic Kernel — README
+
+## 📘 Visão Geral
+
+Este projeto implementa uma **Azure Function (Python)** integrada ao **Semantic Kernel (SK)**, atuando como um **Agente Orquestrador** para unificar e automatizar fluxos entre as APIs educacionais (SED, CESU, ENEM, ENCCEJA, Plataformas de Aprendizagem, Gov.br, etc.).
+O objetivo é criar **resiliência, recuperação automática e orquestração inteligente** de processos pedagógicos e administrativos.
+
+A arquitetura combina **Azure Functions**, **Semantic Kernel**, **API Management (APIM)** e **Application Insights**, garantindo segurança, rastreabilidade e automação em larga escala.
+
+---
+
+## 🧩 Principais Componentes
+
+| Componente               | Função                                                                                       |
+| ------------------------ | -------------------------------------------------------------------------------------------- |
+| **Function App**         | Endpoint central (HTTP Trigger) para receber intenções e executar planos via Semantic Kernel |
+| **Semantic Kernel**      | Motor de orquestração (Planner + Plugins) que traduz intenções em ações concretas nas APIs   |
+| **Plugins (Skills)**     | Implementam integração com cada domínio de API (SED, Gov.br, Certificados, etc.)             |
+| **Azure Storage**        | Persistência de autosave e logs técnicos                                                     |
+| **Redis Cache**          | Armazena tokens e dados temporários para performance                                         |
+| **Key Vault**            | Armazena segredos e chaves com Managed Identity                                              |
+| **Application Insights** | Telemetria e rastreamento de falhas                                                          |
+
+---
+
+## 🏗️ Estrutura de Pastas
+
+```
+azfunc-sk-orchestrator/
+├─ host.json
+├─ requirements.txt
+├─ local.settings.json
+├─ shared/               # Configurações, auth, HTTP utils, storage e telemetry
+├─ sk/                   # Semantic Kernel, planners e plugins
+├─ orchestrate/          # Function principal (HTTP Trigger / API Gateway)
+├─ webhooks/             # Entrada de eventos (travamento, alerta)
+└─ activities/           # Funções longas ou assíncronas (auditoria, sync)
+```
+
+---
+
+## ⚙️ Instalação Local
+
+### 1️⃣ Preparar ambiente virtual
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\\Scripts\\activate
+```
+
+### 2️⃣ Instalar dependências
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3️⃣ Configurar variáveis locais
+
+Copie o exemplo:
+
+```bash
+cp local.settings.example.json local.settings.json
+```
+
+Edite o arquivo e preencha:
+
+```json
+{
+  "Values": {
+    "OPENAI_API_BASE": "https://<seu-aoai>.openai.azure.com/",
+    "OPENAI_API_KEY": "<chave_dev>",
+    "OPENAI_DEPLOYMENT": "gpt-4o-mini",
+    "APIM_BASE": "https://api.sua-org.com"
+  }
+}
+```
+
+### 4️⃣ Executar localmente
+
+```bash
+func start
+```
+
+Acesse via:
+
+```
+http://localhost:7071/api/orchestrate
+```
+
+---
+
+## 🚀 Exemplo de Requisição
+
+### Verificar Certificado ENEM/ENCCEJA
+
+```bash
+curl -X POST http://localhost:7071/api/orchestrate \
+  -H "Content-Type: application/json" \
+  -d '{"intent":"verificar_certificado", "inputs": {"cpf": "12345678901"}}'
+```
+
+### Diagnóstico SED
+
+```bash
+curl -X POST http://localhost:7071/api/orchestrate \
+  -H "Content-Type: application/json" \
+  -d '{"intent":"diagnosticar_sed", "inputs": {"cpf": "12345678901"}}'
+```
+
+---
+
+## 🧠 Integração Semantic Kernel
+
+Cada módulo em `sk/plugins` representa uma **Skill**. Exemplo:
+
+* `GovBrSkill` → `/api/govbr/status/{cpf}`
+* `CertificadosSkill` → `/api/certificados/{cpf}`
+* `SEDLogsSkill` → `/api/sed/logs?cpf={cpf}`
+* `FallbackAutosaveSkill` → autosave local e reenvio em falhas
+
+### Planner
+
+O arquivo `sk/planners/basic.py` contém o **prompt do orquestrador**, que instrui o modelo a:
+
+1. Validar sessão Gov.br.
+2. Consultar logs SED.
+3. Verificar status de sincronização.
+4. Garantir autosave e reenvio automático.
+5. Emitir alertas preventivos (webhook).
+
+---
+
+## 🔐 Segurança
+
+* **Managed Identity** habilitado no Function App.
+* Segredos armazenados no **Key Vault**.
+* Autenticação nas APIs via **APIM** com JWT ou OAuth.
+* **PII Masking** para dados sensíveis (CPF, RA).
+
+---
+
+## 📊 Telemetria e Logs
+
+Integrado com **Application Insights**:
+
+* Eventos (`log_event`) para cada requisição.
+* Latência e falhas agrupadas por Skill.
+* Métricas automáticas via OpenTelemetry.
+
+---
+
+## 🛡️ Fluxos Suportados
+
+| Intenção                | Ação Executada                                                       |
+| ----------------------- | -------------------------------------------------------------------- |
+| `verificar_certificado` | Consulta `/api/certificados/status/{cpf}`                            |
+| `diagnosticar_sed`      | Consulta `/api/sed/logs?cpf={cpf}`                                   |
+| `reenviar_autosave`     | Reenvia dados do cache local via `/api/salafuturo/registro/reenviar` |
+| `status_sincronizacao`  | Verifica `/api/aprendizagem/sincronizacao?ra={ra}`                   |
+| `ping`                  | Teste de conectividade                                               |
+
+---
+
+## ☁️ Deploy no Azure
+
+### 1️⃣ Login e criação do Function App
+
+```bash
+az login
+az functionapp create --resource-group rg-edu --consumption-plan-location brazilsouth \
+  --runtime python --runtime-version 3.11 --functions-version 4 --name func-sk-orq --storage-account <storage>
+```
+
+### 2️⃣ Publicar código
+
+```bash
+func azure functionapp publish func-sk-orq
+```
+
+### 3️⃣ Configurar variáveis de ambiente
+
+```bash
+az functionapp config appsettings set -g rg-edu -n func-sk-orq \
+  --settings OPENAI_API_BASE=https://<aoai>.openai.azure.com/ \
+             OPENAI_DEPLOYMENT=gpt-4o-mini \
+             APIM_BASE=https://api.sua-org.com
+```
+
+---
+
+## 🔁 Próximos Passos
+
+* [ ] Criar Skill de **Ouvidoria** (`/api/chamados/ouvidoria`)
+* [ ] Adicionar **Durable Functions** para sincronizações longas
+* [ ] Integrar **Service Bus** para tickets automáticos
+* [ ] Criar **Dashboard Power BI** via Application Insights API
+
+---
+
+## 👨‍💻 Autor
+
+**José Marcos Ferreira**
+AI Engineer / Data Solutions Architect
+Projeto: *Agente Orquestrador Educacional — Secretaria de Educação SP*

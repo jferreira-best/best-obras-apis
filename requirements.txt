@@ -1,0 +1,13 @@
+# requirements.txt — versões fixas (testadas/disponíveis no PyPI em 29-Oct-2025)
+azure-functions==1.24.0
+requests==2.32.5
+python-dotenv==1.2.1
+
+# Azure SDKs comuns (se sua function usa Search / Identity)
+azure-search-documents==11.6.0
+azure-identity==1.25.1
+azure-core==1.36.0
+
+# OpenAI / Azure OpenAI (se você usa a lib oficial)
+openai==2.6.1
+

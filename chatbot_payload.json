@@ -1,0 +1,24 @@
+{
+  "user_message": "o teto da escola caiu, o que devo fazer?",
+  "bot_reply_short": "```json\n{\n  \"short\": \"É fundamental comunicar imediatamente a situação à administração da escola e às autoridades competentes para garantir a segurança dos alunos. Providências devem ser tomadas para avaliar e reparar os danos estruturais. A segurança dos estudantes deve ser a prioridade máxima.\",\n  \"step_by_step\": [\n    \"1. Notifique a administração da escola sobre o incidente.\",\n    \"2. Entre em contato com as autoridades locais para relatar a situação.\",\n    \"3. Solicite uma avaliação da estrutura da escola para garantir a segurança dos alunos.\"\n  ],\n  \"email\": \"prezado@escola.com.br\\n\\nAssunto: Urgente: Incidente de Estrutura na Escola\\n\\nPrezados,\\n\\nGostaria de informar que o teto da escola caiu, o que representa um risco à segurança dos alunos. Solicito que sejam tomadas providências imediatas para avaliar a situação e garantir a segurança de todos.\\n\\nAtenciosamente,\\n[Seu Nome]\\n[Seu Contato]\",\n  \"confidence\": 0.7,\n  \"sources\": [\n    {\n      \"id\": \"pain_points_n1-pain_points_n1-n2-e-script-c490-cffdf2cff2ff\",\n      \"title\": \"Pain_Points_N1\",\n      \"source\": \"Pain_Points_N1.xls\"\n    },\n    {\n      \"id\": \"pain_points_n1-pain_points_n1-n2-e-script-c3717-13eb8beccc33\",\n      \"title\": \"Pain_Points_N1\",\n      \"source\": \"Pain_Points_N1.xls\"\n    }\n  ],\n  \"next_steps\": \"Acompanhe a resposta da administração e das autoridades sobre as medidas que serão tomadas.\",\n  \"call_to_action\": \"Entre em contato com a administração da escola imediatamente.\"\n}\n```",
+  "show_sources_button": {
+    "label": "Ver evidências",
+    "docs": [
+      {
+        "id": "pain_points_n1-pain_points_n1-n2-e-script-c490-cffdf2cff2ff",
+        "title": "Pain_Points_N1",
+        "source": "Pain_Points_N1.xls"
+      },
+      {
+        "id": "pain_points_n1-pain_points_n1-n2-e-script-c3463-5b0b7df19914",
+        "title": "Pain_Points_N1",
+        "source": "Pain_Points_N1.xls"
+      },
+      {
+        "id": "pain_points_n1-pain_points_n1-n2-e-script-c3717-13eb8beccc33",
+        "title": "Pain_Points_N1",
+        "source": "Pain_Points_N1.xls"
+      }
+    ]
+  }
+}

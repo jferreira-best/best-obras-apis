@@ -1,0 +1,16 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "<connection-string-or-use-development>",
+    "SEARCH_ENDPOINT": "<your-search-endpoint>",
+    "SEARCH_API_KEY": "<your-search-key>",
+    "SEARCH_INDEX": "<your-index-name>",
+    "SEARCH_INDEX_VECTOR_FIELD": "<your-vector-field>",
+    "AOAI_ENDPOINT": "<https://your-aoai-endpoint>",
+    "AOAI_API_KEY": "<your-aoai-key>",
+    "AOAI_CHAT_DEPLOYMENT": "<deployment-name>",
+    "AOAI_CHAT_MODEL": "<model-name-or-placeholder>",
+    "LOG_LEVEL": "INFO"
+  }
+}

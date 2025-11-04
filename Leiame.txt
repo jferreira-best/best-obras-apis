@@ -1,0 +1,49 @@
+##criar/atualizar o índice unificado
+
+python .\pre_process\create_index_kb_conhecimento.py `
+  --search-endpoint <endpoint>`
+  --search-api-key <search-api-key> `
+  --index-name <index-name> `
+  --emb-dim 1536
+
+
+
+## ingerir obras e seduc no mesmo índice
+
+# obras
+1) python ingest_embeddings_azure_search_obras.py `
+  --jsonl-blob "jsonl/kb_obras.jsonl" `
+  --storage-conn "%STORAGE_CONN%" `
+  --container obras `
+  --search-endpoint index-name `
+  --search-endpoint <endpoint> `
+  --search-api-key <search-api-key> `
+  --search-index "kb-conhecimento" `
+  --aoai-endpoint <aoai-endpoint> `
+  --aoai-key "<AOAI_KEY>"  `
+  --aoai-emb-deployment "text-embedding-3-small"
+
+5 ) Variaveis de ambiente
+
+# === Azure AI Search ===
+$env:SEARCH_ENDPOINT = "https://<seu-search>.search.windows.net"
+$env:SEARCH_API_KEY  = "<chave-admin-do-search>"
+$env:SEARCH_INDEX    = "kb-conhecimento"
+
+# === Azure OpenAI (Embeddings) ===
+$env:OPENAI_API_TYPE = "azure"
+$env:OPENAI_API_BASE = "https://<seu-recurso-aoai>.openai.azure.com"
+$env:OPENAI_API_KEY  = "<sua-chave-aoai>"
+$env:OPENAI_API_VERSION = "2024-08-01-preview"   # ou a que você estiver usando
+$env:EMBEDDINGS_DEPLOYMENT = "text-embedding-3-small"  # nome do deployment criado por você
+
+# === Azure Storage (seus scripts usam Blob em alguns pontos) ===
+$env:STORAGE_CONN = "DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net"
+$env:BLOB_CONTAINER = "autosave"  # ajuste se necessário
+
+
+
+
+
+
+

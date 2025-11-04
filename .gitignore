@@ -75,3 +75,9 @@ cache/
 node_modules/
 npm-debug.log*
 yarn-error.log*
+
+# Azurite / dev stores
+AzuriteConfig/
+__azurite_db_*.json
+__blobstorage__/
+azurite_data/
