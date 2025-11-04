@@ -1,0 +1,6 @@
+# (recomendo criar branch antes)
+git checkout -b fix/shared-function-app
+git apply patch_shared_function_app.diff
+# revisar mudanças, testar localmente e commitar
+git add shared/function_app.py
+git commit -m "Refactor shared/function_app.py: retry session, unified helpers, process_query"

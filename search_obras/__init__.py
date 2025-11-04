@@ -1,61 +1,35 @@
-import logging
+# search_obras/__init__.py
 import json
+import logging
 import azure.functions as func
-from typing import Any, Dict
 
-# importa diretamente a função que você já tem
-from function_app import generate_client_response
+from shared import function_app as fa
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("HTTP trigger: search_obras called")
+    logging.info("search_obras HTTP trigger received")
+
     try:
-        req_body_bytes = req.get_body()
-        if not req_body_bytes:
-            return func.HttpResponse(
-                json.dumps({"error":"empty body","hint":"send JSON with query"}, ensure_ascii=False),
-                status_code=400,
-                mimetype="application/json"
-            )
+        body = req.get_json()
+    except ValueError:
+        body = {k: v for k, v in req.params.items()}
 
-        body = json.loads(req_body_bytes.decode("utf-8"))
-    except Exception as e:
-        logging.exception("failed parsing body")
-        return func.HttpResponse(
-            json.dumps({"error":"invalid json","detail": str(e)}, ensure_ascii=False),
-            status_code=400,
-            mimetype="application/json"
-        )
-
-    # validações mínimas
-    query = body.get("query") or body.get("q")
-    if not query or not isinstance(query, str) or not query.strip():
-        return func.HttpResponse(
-            json.dumps({"error":"missing 'query' field"}, ensure_ascii=False),
-            status_code=400,
-            mimetype="application/json"
-        )
-
-    # normaliza topK/debug e prepara payload
     try:
-        topK = int(body.get("topK") or body.get("topk") or 5)
-    except Exception:
-        topK = 5
-    debug = bool(body.get("debug", False))
+        # Chama o handler no shared/function_app.py
+        # Ajuste o nome abaixo se o seu handler tiver outro nome.
+        result = fa.handle_search_request(body)
 
-    payload = {"query": query, "topK": topK, "debug": debug, **{k:v for k,v in body.items() if k not in ("query","topK","topk","debug")}}
+        if isinstance(result, func.HttpResponse):
+            return result
 
-    # delega para sua função principal
-    try:
-        response_obj = generate_client_response(payload)
         return func.HttpResponse(
-            json.dumps(response_obj, ensure_ascii=False),
+            json.dumps(result, ensure_ascii=False),
             status_code=200,
-            mimetype="application/json; charset=utf-8"
+            mimetype="application/json"
         )
     except Exception as e:
-        logging.exception("internal error in search handler")
+        logging.exception("Erro processando search_obras")
         return func.HttpResponse(
-            json.dumps({"error":"internal error","detail": str(e)}, ensure_ascii=False),
+            json.dumps({"error": str(e)}),
             status_code=500,
             mimetype="application/json"
         )

@@ -1,525 +1,535 @@
-# function_app.py
-# Azure Function HTTP app — versão integrada a partir de generate_client_response.py
-# Rotas:
-#  - GET  /api/ping
-#  - GET  /api/debug/env
-#  - POST /api/search/obras
-#
-# Expect environment variables:
-#  SEARCH_ENDPOINT, SEARCH_API_KEY, SEARCH_INDEX, SEARCH_API_VERSION (opt)
-#  SEARCH_PROFILE (opt)
-#  SEARCH_VECTOR_FIELD (opt)
-#  AOAI_ENDPOINT, AOAI_API_KEY, AOAI_EMB_DEPLOYMENT, AOAI_CHAT_DEPLOYMENT, AOAI_API_VERSION (opt)
-#  DEFAULT_TOPK, MAX_TOPK, REQUEST_TIMEOUT, AOAI_CHAT_MAX_TOKENS (opts)
-#
-# Notes:
-#  - This code intentionally uses the Azure OpenAI REST endpoints (AOAI) and Azure Cognitive Search REST APIs.
-#  - It prefers vectorQueries payload (same shape as generate_client_response.py) to avoid "$select annotation" issues.
-#  - Minimal filesystem writes go to /tmp (Azure Functions Linux) or working dir if available.
-#  - Returns a JSON payload with hits and generated answer (or fallback summary).
+# shared/function_app.py
+"""
+Shared function app helpers and main handler used by Azure Functions.
+Updated: stronger AOAI prompt (returns structured JSON), better fallbacks and logging.
+"""
+from __future__ import annotations
 import os
 import json
 import logging
+import re
+import textwrap
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
-
 import requests
-import azure.functions as func
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from json.decoder import JSONDecoder
 
-# -------------------------
-# Environment helpers
-# -------------------------
-def get_env(name: str, default: Any = None, required: bool = False):
-    v = os.environ.get(name, default)
-    if required and (v is None or str(v).strip() == ""):
-        raise EnvironmentError(f"Missing required environment variable: {name}")
-    return v
+# ---------------------------
+# Configuration (env / defaults)
+# ---------------------------
+COG_SEARCH_ENDPOINT = os.environ.get("COG_SEARCH_ENDPOINT") or os.environ.get("SEARCH_ENDPOINT")
+COG_SEARCH_KEY      = os.environ.get("COG_SEARCH_KEY") or os.environ.get("SEARCH_API_KEY")
+COG_SEARCH_INDEX    = os.environ.get("COG_SEARCH_INDEX") or os.environ.get("SEARCH_INDEX")
 
-# -------------------------
-# Load configuration
-# -------------------------
-SEARCH_ENDPOINT = get_env("SEARCH_ENDPOINT", required=True)
-SEARCH_API_KEY = get_env("SEARCH_API_KEY", required=True)
-SEARCH_INDEX = get_env("SEARCH_INDEX", "kb-obras")
-SEARCH_PROFILE = get_env("SEARCH_PROFILE", None)  # semantic config name (optional)
-SEARCH_VECTOR_FIELD = get_env("SEARCH_VECTOR_FIELD", "content_vector")
-SEARCH_API_VERSION = get_env("SEARCH_API_VERSION", "2024-07-01")
+AOAI_ENDPOINT = os.environ.get("AOAI_ENDPOINT") or os.environ.get("OPENAI_ENDPOINT") or ""
+AOAI_API_KEY  = os.environ.get("AOAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
 
-AOAI_ENDPOINT = get_env("AOAI_ENDPOINT", required=True)
-AOAI_API_KEY = get_env("AOAI_API_KEY", required=True)
-AOAI_EMB_DEPLOYMENT = get_env("AOAI_EMB_DEPLOYMENT", "text-embedding-3-large")
-AOAI_CHAT_DEPLOYMENT = get_env("AOAI_CHAT_DEPLOYMENT", required=True)
-AOAI_API_VERSION = get_env("AOAI_API_VERSION", "2024-02-15-preview")
+AOAI_ENDPOINT = AOAI_ENDPOINT.rstrip("/")
+AOAI_EMB_DEPLOYMENT = os.environ.get("AOAI_EMB_DEPLOYMENT") or os.environ.get("AOAI_EMBEDDING_DEPLOYMENT") or "text-embedding-3-large"
+AOAI_CHAT_DEPLOYMENT = os.environ.get("AOAI_CHAT_DEPLOYMENT") or os.environ.get("AOAI_DEPLOYMENT") or "gpt-4o-mini"
+AOAI_API_VERSION = os.environ.get("AOAI_API_VERSION") or "2024-02-15-preview"
+AOAI_CHAT_MAX_TOKENS = int(os.environ.get("AOAI_CHAT_MAX_TOKENS", "1024"))
 
-DEFAULT_TOPK = int(get_env("DEFAULT_TOPK", "5"))
-MAX_TOPK = int(get_env("MAX_TOPK", "10"))
-REQUEST_TIMEOUT = int(get_env("REQUEST_TIMEOUT", "30"))
-AOAI_CHAT_MAX_TOKENS = int(get_env("AOAI_CHAT_MAX_TOKENS", "800"))
+COG_SEARCH_API_VERSION = os.environ.get("SEARCH_API_VERSION") or os.environ.get("COG_SEARCH_API_VERSION") or "2024-07-01"
+COG_SEARCH_ENDPOINT = (COG_SEARCH_ENDPOINT or "").rstrip("/")
+COG_SEARCH_KEY = COG_SEARCH_KEY or ""
+COG_SEARCH_INDEX = COG_SEARCH_INDEX or os.environ.get("SEARCH_INDEX") or ""
 
-HEADERS_SEARCH = {"api-key": SEARCH_API_KEY, "Content-Type": "application/json"}
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
+DEFAULT_TOPK = int(os.environ.get("DEFAULT_TOPK", "5"))
+MAX_TOPK = int(os.environ.get("MAX_TOPK", "15"))
 
-# -------------------------
-# Utilities
-# -------------------------
-def save_file(path: str, content: Any):
+COG_SEARCH_VECTOR_FIELD = os.environ.get("SEARCH_VECTOR_FIELD") or os.environ.get("COG_SEARCH_VECTOR_FIELD") or "content_vector"
+SEARCH_SELECT_FIELDS = os.environ.get("SEARCH_SELECT_FIELDS") or "id,text,doc_title,source_file"
+
+FORCE_TEXT_SEARCH = str(os.environ.get("FORCE_TEXT_SEARCH") or "false").lower() in ("1", "true", "yes")
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---------------------------
+# HTTP Session with Retry
+# ---------------------------
+SESSION = requests.Session()
+_RETRY = Retry(
+    total=3,
+    backoff_factor=0.6,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=frozenset(["GET", "POST", "PUT", "DELETE", "HEAD"])
+)
+SESSION.mount("https://", HTTPAdapter(max_retries=_RETRY))
+SESSION.mount("http://", HTTPAdapter(max_retries=_RETRY))
+
+
+# ---------------------------
+# Utility helpers
+# ---------------------------
+def to_str_safe(v: Any, max_len: int = 2000) -> str:
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            if isinstance(content, (dict, list)):
-                json.dump(content, f, ensure_ascii=False, indent=2)
-            else:
-                f.write(str(content))
+        s = str(v)
+    except Exception:
+        s = "<unserializable>"
+    return s if len(s) <= max_len else s[:max_len] + "..."
+
+
+def request_json(method: str, url: str, headers: Optional[Dict[str, str]] = None,
+                 json_payload: Optional[Dict[str, Any]] = None,
+                 params: Optional[Dict[str, Any]] = None,
+                 timeout: int = REQUEST_TIMEOUT) -> Any:
+    headers = headers or {}
+    try:
+        if method.lower() == "post":
+            resp = SESSION.post(url, headers=headers, json=json_payload, params=params, timeout=timeout)
+        else:
+            resp = SESSION.get(url, headers=headers, params=params, timeout=timeout)
     except Exception as e:
-        logging.debug(f"Could not save file {path}: {e}")
+        logger.exception("HTTP request failed")
+        raise RuntimeError(f"HTTP request failed: {e}")
 
-def to_str_safe(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return "\n".join([to_str_safe(x) for x in value])
-    if isinstance(value, dict):
-        return json.dumps(value, ensure_ascii=False, indent=2)
-    return str(value)
+    if resp.status_code not in (200, 201):
+        snippet = (resp.text or "")[:2000]
+        raise RuntimeError(f"HTTP {resp.status_code} for {url}: {snippet}")
 
-# -------------------------
-# AOAI: embeddings & chat
-# -------------------------
+    try:
+        return resp.json()
+    except Exception:
+        return resp.text
+
+
+def parse_json_from_text(text: str) -> Any:
+    if not text:
+        return None
+    s = text.strip()
+    s = re.sub(r"^```(?:json)?\s*", "", s)
+    s = re.sub(r"\s*```$", "", s)
+
+    decoder = JSONDecoder()
+    for i in range(len(s)):
+        try:
+            obj, idx = decoder.raw_decode(s[i:])
+            return obj
+        except ValueError:
+            continue
+    try:
+        return json.loads(s)
+    except Exception:
+        return {"text": s}
+
+
+# ---------------------------
+# Synthesizer (fallback summarizer)
+# ---------------------------
+def synthesize_answer(query: str, hits: list, max_total_chars: int = 3500) -> str:
+    # If AOAI not configured, just concatenate short excerpts
+    aoai_endpoint = AOAI_ENDPOINT
+    aoai_key = AOAI_API_KEY
+    aoai_deploy = AOAI_CHAT_DEPLOYMENT
+    aoai_api_ver = AOAI_API_VERSION or "2024-02-15-preview"
+
+    if not (aoai_endpoint and aoai_key and aoai_deploy):
+        texts = []
+        for h in hits[:5]:
+            t = (h.get("text") or h.get("raw", {}).get("text", "") or "").strip()
+            texts.append(textwrap.shorten(t, width=800, placeholder=" ..."))
+        return "\n\n".join(texts) or "No content to summarize."
+
+    snippets = []
+    total_chars = 0
+    for i, h in enumerate(hits, start=1):
+        raw_text = (h.get("text") or h.get("raw", {}).get("text", "") or "").strip()
+        src = h.get("raw", {}).get("source_file") or h.get("source_file") or h.get("id", "unknown")
+        remaining = max_total_chars - total_chars
+        if remaining <= 0:
+            break
+        per_hit = min(800, remaining)
+        excerpt = textwrap.shorten(raw_text.replace("\n", " "), width=per_hit, placeholder=" ...")
+        snippet = f"[{i}] SOURCE: {src}\n{excerpt}"
+        snippets.append(snippet)
+        total_chars += len(snippet)
+
+    context_text = "\n\n".join(snippets) if snippets else "No document content available."
+
+    system_msg = (
+        "You are an assistant that reads short document excerpts and the user's question, "
+        "then returns a single concise, actionable answer in Portuguese. "
+        "Be precise, give 3-6 short action steps or recommendations, and cite the source index in square brackets like [1]."
+    )
+    user_msg = f"Pergunta: {query}\n\nTrechos:\n{context_text}\n\nGere uma resposta curta e prática (3-6 bullets) em Português."
+
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 512
+    }
+
+    url = aoai_endpoint.rstrip("/") + f"/openai/deployments/{aoai_deploy}/chat/completions?api-version={aoai_api_ver}"
+    headers = {"api-key": aoai_key, "Content-Type": "application/json"}
+
+    try:
+        resp = request_json("post", url, headers=headers, json_payload=payload)
+        choices = resp.get("choices") or []
+        if choices and isinstance(choices, list):
+            first = choices[0]
+            msg = first.get("message", {}).get("content") or first.get("text") or ""
+        else:
+            msg = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return msg.strip() if isinstance(msg, str) else json.dumps(msg)
+    except Exception as e:
+        fallback_texts = []
+        for i, h in enumerate(hits[:5], start=1):
+            t = (h.get("text") or h.get("raw", {}).get("text", "") or "").strip()
+            fallback_texts.append(f"[{i}] " + textwrap.shorten(t, width=400, placeholder=" ..."))
+        return "Não foi possível sintetizar via AOAI: " + str(e) + "\n\nFragmentos:\n\n" + "\n\n".join(fallback_texts)
+
+
+# ---------------------------
+# AOAI helpers
+# ---------------------------
 def get_embedding(text: str) -> List[float]:
-    url = AOAI_ENDPOINT.rstrip("/") + f"/openai/deployments/{AOAI_EMB_DEPLOYMENT}/embeddings?api-version={AOAI_API_VERSION}"
+    if not AOAI_ENDPOINT or not AOAI_API_KEY:
+        raise RuntimeError("AOAI_ENDPOINT or AOAI_API_KEY not set in environment")
+    url = f"{AOAI_ENDPOINT}/openai/deployments/{AOAI_EMB_DEPLOYMENT}/embeddings?api-version={AOAI_API_VERSION}"
     headers = {"api-key": AOAI_API_KEY, "Content-Type": "application/json"}
     payload = {"input": text}
-    resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
-    if resp.status_code not in (200, 201):
-        raise RuntimeError(f"AOAI embeddings error: {resp.status_code} {resp.text}")
-    body = resp.json()
+    body = request_json("post", url, headers=headers, json_payload=payload)
     try:
         emb = body["data"][0]["embedding"]
         if not isinstance(emb, list):
-            raise ValueError("Unexpected embedding format")
+            raise RuntimeError("Unexpected embedding format")
         return emb
     except Exception as e:
-        raise RuntimeError(f"Failed to extract embedding: {e} -- resp: {json.dumps(body)[:2000]}")
+        logger.exception("Failed to extract embedding from AOAI response")
+        raise RuntimeError(f"Failed to extract embedding: {e} -- snippet: {to_str_safe(body)[:1000]}")
 
-def call_aoai_chat(system_prompt: str, user_prompt: str) -> Dict[str, Any]:
-    url = AOAI_ENDPOINT.rstrip("/") + f"/openai/deployments/{AOAI_CHAT_DEPLOYMENT}/chat/completions?api-version={AOAI_API_VERSION}"
+
+def call_aoai_chat(system_prompt: str, user_prompt: str, max_tokens: int = None) -> Any:
+    if not AOAI_ENDPOINT or not AOAI_API_KEY:
+        raise RuntimeError("AOAI_ENDPOINT or AOAI_API_KEY not set")
+    if max_tokens is None:
+        max_tokens = AOAI_CHAT_MAX_TOKENS
+    url = f"{AOAI_ENDPOINT}/openai/deployments/{AOAI_CHAT_DEPLOYMENT}/chat/completions?api-version={AOAI_API_VERSION}"
     headers = {"api-key": AOAI_API_KEY, "Content-Type": "application/json"}
     payload = {
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        "max_tokens": AOAI_CHAT_MAX_TOKENS,
+        "max_tokens": max_tokens,
         "temperature": 0.0
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
-    if resp.status_code not in (200, 201):
-        raise RuntimeError(f"AOAI chat error: {resp.status_code} {resp.text}")
-    return resp.json()
+    return request_json("post", url, headers=headers, json_payload=payload)
 
-# -------------------------
-# Azure Cognitive Search: vector query using vectorQueries (safe)
-# -------------------------
-def search_vector(embedding: List[float], topk: int = DEFAULT_TOPK) -> Dict[str, Any]:
-    topk = min(int(topk), MAX_TOPK)
-    url = SEARCH_ENDPOINT.rstrip("/") + f"/indexes/{SEARCH_INDEX}/docs/search?api-version={SEARCH_API_VERSION}"
-    headers = HEADERS_SEARCH
-    # avoid selecting @search.score in 'select' (causes 400 if combined with annotations)
-    select = "id,doc_title,source_file,text,chunk"
-    body = {
+
+def extract_chat_content(chat_resp: Any) -> str:
+    if not chat_resp:
+        return ""
+    try:
+        if isinstance(chat_resp, dict):
+            choices = chat_resp.get("choices") or chat_resp.get("choices", [])
+            if choices and isinstance(choices, list):
+                c0 = choices[0]
+                if isinstance(c0, dict):
+                    msg = c0.get("message") or c0.get("message", {})
+                    if isinstance(msg, dict) and "content" in msg:
+                        return msg["content"]
+                    if "text" in c0:
+                        return c0["text"]
+        return to_str_safe(chat_resp)
+    except Exception:
+        logger.exception("Failed to extract chat content")
+        return to_str_safe(chat_resp)
+
+
+# ---------------------------
+# Azure Cognitive Search helpers
+# ---------------------------
+def search_vector(embedding: list, topk: int = None) -> Any:
+    if topk is None:
+        topk = DEFAULT_TOPK
+    if not (COG_SEARCH_ENDPOINT and COG_SEARCH_KEY and COG_SEARCH_INDEX):
+        raise RuntimeError("COG_SEARCH_ENDPOINT or COG_SEARCH_KEY or COG_SEARCH_INDEX not set")
+    api_ver = COG_SEARCH_API_VERSION
+    url = f"{COG_SEARCH_ENDPOINT}/indexes/{COG_SEARCH_INDEX}/docs/search?api-version={api_ver}"
+    headers = {"api-key": COG_SEARCH_KEY, "Content-Type": "application/json"}
+    vector_field = os.environ.get("SEARCH_VECTOR_FIELD") or os.environ.get("COG_SEARCH_VECTOR_FIELD") or COG_SEARCH_VECTOR_FIELD
+
+    payload = {
+        # vectorQueries (2024-07-01+)
         "count": True,
-        "select": select,
+        "select": os.environ.get("SEARCH_SELECT_FIELDS") or SEARCH_SELECT_FIELDS,
         "vectorQueries": [
             {
                 "kind": "vector",
                 "vector": embedding,
-                "fields": SEARCH_VECTOR_FIELD,
+                "fields": vector_field,
                 "k": topk
             }
-        ],
+        ]
+    }
+    return request_json("post", url, headers=headers, json_payload=payload, timeout=120)
+
+
+def text_search(query: str, topk: int = None) -> Any:
+    if topk is None:
+        topk = DEFAULT_TOPK
+    if not (COG_SEARCH_ENDPOINT and COG_SEARCH_KEY and COG_SEARCH_INDEX):
+        raise RuntimeError("COG_SEARCH_ENDPOINT or COG_SEARCH_KEY or COG_SEARCH_INDEX not set")
+    api_ver = COG_SEARCH_API_VERSION
+    url = f"{COG_SEARCH_ENDPOINT}/indexes/{COG_SEARCH_INDEX}/docs/search?api-version={api_ver}"
+    headers = {"api-key": COG_SEARCH_KEY, "Content-Type": "application/json"}
+    payload = {
+        "search": query or "*",
         "top": topk
     }
-    if SEARCH_PROFILE:
-        body["semanticConfiguration"] = SEARCH_PROFILE
-    resp = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
-    if resp.status_code not in (200, 201):
-        raise RuntimeError(f"Azure Search error: {resp.status_code} {resp.text}")
-    return resp.json()
+    return request_json("post", url, headers=headers, json_payload=payload, timeout=REQUEST_TIMEOUT)
 
-def text_search(query: str, topk: int = DEFAULT_TOPK) -> Dict[str, Any]:
-    topk = min(int(topk), MAX_TOPK)
-    url = SEARCH_ENDPOINT.rstrip("/") + f"/indexes/{SEARCH_INDEX}/docs/search?api-version={SEARCH_API_VERSION}"
-    headers = HEADERS_SEARCH
-    select = "id,doc_title,source_file,text,chunk"
-    body = {"search": query, "top": topk, "select": select}
-    if SEARCH_PROFILE:
-        body["semanticConfiguration"] = SEARCH_PROFILE
-    resp = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
-    if resp.status_code not in (200, 201):
-        raise RuntimeError(f"Azure Search text query failed: {resp.status_code} {resp.text}")
-    return resp.json()
 
-def get_doc_by_id(doc_id: str) -> Dict[str, Any]:
-    encoded = quote(doc_id, safe='')
-    url = SEARCH_ENDPOINT.rstrip("/") + f"/indexes/{SEARCH_INDEX}/docs/{encoded}?api-version={SEARCH_API_VERSION}"
-    headers = {"api-key": SEARCH_API_KEY}
-    resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-    if resp.status_code == 200:
-        return resp.json()
-    return {"_fetch_error_status": resp.status_code, "_fetch_error_text": resp.text}
+def parse_search_hits(search_json: Any) -> List[Dict[str, Any]]:
+    hits: List[Dict[str, Any]] = []
+    if not search_json:
+        return hits
+    if isinstance(search_json, dict) and "value" in search_json and isinstance(search_json["value"], list):
+        for item in search_json["value"]:
+            entry = {
+                "id": item.get("id") or item.get("docId") or item.get("metadata_storage_path") or item.get("@search.documentkey"),
+                "score": item.get("@search.score") or item.get("score") or None,
+                "text": item.get("text") or item.get("content") or item.get("description") or item.get("normalized_text") or item.get("ocr_text") or None,
+                "raw": item
+            }
+            hits.append(entry)
+        return hits
+    if isinstance(search_json, dict) and "results" in search_json:
+        for r in search_json["results"]:
+            hits.append({"id": r.get("id"), "score": r.get("score"), "text": r.get("text") or None, "raw": r})
+        return hits
+    if isinstance(search_json, list):
+        for item in search_json:
+            hits.append({"id": item.get("id") if isinstance(item, dict) else None, "score": item.get("score") if isinstance(item, dict) else None, "text": item.get("text") if isinstance(item, dict) else to_str_safe(item), "raw": item})
+        return hits
+    hits.append({"id": None, "score": None, "text": to_str_safe(search_json), "raw": search_json})
+    return hits
 
-def dedupe_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+
+def dedupe_results(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
     out = []
-    for r in results:
-        doc_id = r.get("id") or r.get("key") or r.get("raw", {}).get("id") or r.get("raw", {}).get("documentId")
-        text = r.get("text") or r.get("content") or ""
-        fingerprint = (doc_id if doc_id else text[:200])
-        if fingerprint in seen:
+    for h in hits:
+        key = h.get("id") or to_str_safe(h.get("text", ""))[:200]
+        if key in seen:
             continue
-        seen.add(fingerprint)
-        out.append(r)
+        seen.add(key)
+        out.append(h)
     return out
 
-def parse_search_hits(search_json: Dict[str, Any]) -> List[Dict[str, Any]]:
-    hits = search_json.get("value") or search_json.get("results") or []
-    parsed = []
-    for item in hits:
-        parsed.append({
-            "id": item.get("id"),
-            "doc_title": item.get("doc_title") or item.get("title"),
-            "source_file": item.get("source_file") or item.get("source"),
-            "text": item.get("text") or item.get("content"),
-            "chunk": item.get("chunk"),
-            "raw": item
-        })
-    return parsed
 
-# -------------------------
-# Prompt builder (rerank/generate) - formal/concise pt-BR (based on your original)
-# -------------------------
+def get_doc_by_id(doc_id: str) -> Dict[str, Any]:
+    if not doc_id:
+        return {"id": None, "text": None}
+    if COG_SEARCH_ENDPOINT and COG_SEARCH_KEY:
+        url = f"{COG_SEARCH_ENDPOINT}/indexes/{COG_SEARCH_INDEX}/docs('{doc_id}')?api-version=2021-04-30-Preview"
+        headers = {"api-key": COG_SEARCH_KEY}
+        try:
+            resp = request_json("get", url, headers=headers)
+            if isinstance(resp, dict):
+                return {"id": resp.get("id") or doc_id, "text": resp.get("content") or resp.get("ocr_text") or resp.get("text") or resp.get("description") or None, "raw": resp}
+        except Exception:
+            logger.debug("get_doc_by_id: fallback to minimal record")
+    return {"id": doc_id, "text": None}
+
+
+# ---------------------------
+# Prompt builder for reranking / generation
+# ---------------------------
 def build_rerank_prompt(query: str, docs: List[Dict[str, Any]]) -> Tuple[str, str]:
-    system = (
-        "Você é um assistente profissional que consolida evidências de busca em uma resposta final destinada a clientes. "
-        "Responda em Português do Brasil (pt-BR), tom formal e conciso. Produza APENAS um objeto JSON válido (sem texto adicional) "
-        "com os seguintes campos obrigatórios:\n"
-        " - short: resposta curta, formal, no máximo 3 frases.\n"
-        " - step_by_step: lista (array) de passos claros e numerados para o usuário executar (cada passo uma string).\n"
-        " - email: e-mail formal pronto para envio (string).\n"
-        " - confidence: número entre 0 e 1 que representa a confiança baseada nas evidências.\n"
-        " - sources: lista de objetos com {id, title, source} correspondentes às evidências utilizadas.\n"
-        " - next_steps: breve sugestão de próximos passos operacionais (string).\n"
-        " - call_to_action: instrução clara do que o usuário deve fazer a seguir (string).\n\n"
-        "Regras estritas:\n"
-        "1) NÃO invente fatos. Se uma informação não estiver nas evidências, escreva 'informação insuficiente' no campo apropriado.\n"
-        "2) Cite apenas as fontes enviadas (use os ids fornecidos).\n"
-        "3) Se a evidência for fraca, ajuste confidence para um valor baixo (ex.: 0.0 - 0.6). Se forte, use 0.7-1.0.\n"
-        "4) Retorne APENAS o JSON (não adicione explicações fora do JSON).\n"
+    system_prompt = (
+        "Você é um assistente que responde em Português. Use apenas as fontes fornecidas para construir a resposta. "
+        "Retorne EXCLUSIVAMENTE um JSON válido com a estrutura: {\"text\": \"resumo curto\", \"bullets\": [\"acao1\", \"acao2\"]}. "
+        "Se não houver informação suficiente, retorne {\"text\": \"... (explique o que falta)\", \"bullets\": []}. "
+        "Não inclua campos extras fora desse JSON top-level."
     )
-
-    pieces = [f"Query: {query}", "Evidence (top results):"]
+    doc_texts = []
     for i, d in enumerate(docs, start=1):
-        doc_id = d.get("id") or "<no-id>"
-        title = d.get("doc_title") or "<no-title>"
-        source = d.get("source_file") or "<no-source>"
-        snippet = (d.get("text") or "")[:1000].strip().replace("\n", " ")
-        pieces.append(f"{i}) id: {doc_id}\n title: {title}\n source: {source}\n snippet: {snippet}\n")
-    pieces.append("Task: Com base SOMENTE nas evidências acima, gere o JSON descrito. Não inclua texto fora do JSON. Se faltar informação, use 'informação insuficiente'.")
-    user = "\n\n".join(pieces)
-    return system, user
+        src = None
+        if isinstance(d.get("raw"), dict):
+            src = d["raw"].get("metadata_storage_path") or d["raw"].get("source_file") or d["raw"].get("source")
+        src = src or d.get("id")
+        text = d.get("text") or ""
+        one = f"Fonte {i} | id: {src or d.get('id')}\n{text[:2000]}"
+        doc_texts.append(one)
+    user_prompt = (
+        f"Pergunta: {query}\n\n"
+        "Fontes:\n" + ("\n\n---\n\n".join(doc_texts) if doc_texts else "Nenhuma fonte disponível.\n") + "\n\n"
+        "Tarefa: Responda em Português COMPACTAMENTE e em formato JSON conforme a estrutura pedida. Cite fontes entre colchetes se for usar trechos (ex: [1])."
+    )
+    return system_prompt, user_prompt
 
-def extract_chat_content(chat_resp: Dict[str, Any]) -> str:
-    try:
-        choices = chat_resp.get("choices", [])
-        if choices:
-            content = choices[0].get("message", {}).get("content") or choices[0].get("text") or ""
-            return content
-    except Exception:
-        pass
-    return json.dumps(chat_resp, ensure_ascii=False)
 
-def parse_json_from_text(text: str) -> Any:
-    # Try to find the first JSON object in the text
-    try:
-        s = text.strip()
-        if s.startswith("```"):
-            parts = s.split("```")
-            for p in parts:
-                p = p.strip()
-                if p.startswith("{") or p.startswith("["):
-                    s = p
-                    break
-        idx = s.find("{")
-        if idx != -1:
-            candidate = s[idx:]
-            return json.loads(candidate)
-        # fallback: try to parse whole text
-        return json.loads(s)
-    except Exception:
-        return {"text": text}
+# ---------------------------
+# Central processing flow
+# ---------------------------
+def process_query(query: str, topk: int = DEFAULT_TOPK, debug: bool = False) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"query": query, "topK": topk, "used_embedding": False, "fallback_to_text": False, "hits_count": 0, "hits": [], "answer": None, "error": None}
+    if not query or not str(query).strip():
+        return {"error": "missing 'query' or query is empty", "status": 400}
 
-# -------------------------
-# Azure Function routes
-# -------------------------
-app = func.FunctionApp()
-
-@app.route(route="ping", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
-def ping(req: func.HttpRequest) -> func.HttpResponse:
-    return func.HttpResponse(json.dumps({"status": "ok", "service": "semantic_search_obras"}, ensure_ascii=False), status_code=200, mimetype="application/json")
-
-@app.route(route="debug/env", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
-def debug_env(req: func.HttpRequest) -> func.HttpResponse:
-    keys = [
-        "SEARCH_ENDPOINT", "SEARCH_INDEX", "SEARCH_API_KEY", "SEARCH_API_VERSION",
-        "AOAI_ENDPOINT", "AOAI_EMB_DEPLOYMENT", "AOAI_CHAT_DEPLOYMENT", "AOAI_API_VERSION"
-    ]
-    out = {k: (os.getenv(k) or None) for k in keys}
-    return func.HttpResponse(json.dumps(out, ensure_ascii=False, indent=2), status_code=200, mimetype="application/json")
-
-def generate_client_response(body: dict) -> dict:
-    """
-    Adapter puro: recebe payload (dict) e retorna um dict serializável
-    com a mesma estrutura do payload que hoje a rota devolve.
-    """
-    query = (body.get("query") or "").strip()
-    if not query:
-        return {"error": "missing 'query' in body", "status": 400}
-
-    requested_topk = int(body.get("topK", DEFAULT_TOPK))
-    topk = min(requested_topk, MAX_TOPK)
-    debug = bool(body.get("debug", False))
-
-    response_payload: Dict[str, Any] = {
-        "query": query,
-        "topK": topk,
-        "used_embedding": False,
-        "fallback_to_text": False,
-        "hits_count": 0,
-        "hits": [],
-        "answer": None,
-        "debug": None
-    }
-
-    # 1) Embedding + vector search (preferred)
     embedding = None
     try:
         embedding = get_embedding(query)
-        response_payload["used_embedding"] = True
+        result["used_embedding"] = True
     except Exception as e:
-        logging.warning(f"Erro gerando embedding: {e}")
-        response_payload["embed_error"] = str(e)
+        logger.warning("Embedding failed, will fallback to text search: %s", e)
+        result["embedding_error"] = to_str_safe(e)
+        result["used_embedding"] = False
 
-    search_json = None
     try:
-        if embedding:
+        if embedding and not FORCE_TEXT_SEARCH:
             try:
                 search_json = search_vector(embedding, topk=topk)
-            except Exception as ve:
-                logging.warning(f"Vector search failed: {ve} — falling back to text search")
-                response_payload["fallback_to_text"] = True
+            except Exception as e:
+                logger.warning("Vector search failed, fallback to text search: %s", e)
+                result["fallback_to_text"] = True
                 search_json = text_search(query, topk=topk)
         else:
-            response_payload["fallback_to_text"] = True
+            result["fallback_to_text"] = True
             search_json = text_search(query, topk=topk)
 
         hits = parse_search_hits(search_json)
         hits = dedupe_results(hits)
-        response_payload["hits_count"] = len(hits)
-        response_payload["hits"] = hits
+        result["hits_count"] = len(hits)
+        result["hits"] = hits
         if debug:
-            response_payload["search_raw"] = search_json
+            result["search_raw"] = search_json
+    except Exception as e:
+        logger.exception("Search failed")
+        return {"error": f"search failed: {e}", "status": 500}
 
-    except Exception as e_search:
-        logging.exception("Erro na chamada ao Azure Search")
-        return {"error": f"Erro na busca: {e_search}", "status": 500}
-
-    # 2) Try to fetch full docs for top hits (best-effort)
+    # fetch docs best-effort
     full_docs = []
-    for r in response_payload["hits"][:min(5, topk)]:
-        doc_id = r.get("id")
+    for h in result["hits"][:min(MAX_TOPK, topk)]:
+        doc_id = h.get("id")
         if doc_id:
             try:
                 doc_full = get_doc_by_id(doc_id)
-                if isinstance(doc_full, dict) and doc_full.get("id"):
-                    combined = {**r, **doc_full}
-                    full_docs.append(combined)
-                else:
-                    r["_fetch_error"] = doc_full
-                    full_docs.append(r)
+                merged = {**h, **(doc_full or {})}
+                full_docs.append(merged)
             except Exception as e:
-                r["_fetch_error"] = str(e)
-                full_docs.append(r)
+                logger.debug("Failed fetch doc %s: %s", doc_id, e)
+                h["_fetch_error"] = to_str_safe(e)
+                full_docs.append(h)
         else:
-            full_docs.append(r)
+            full_docs.append(h)
 
-    # Save evidence file (optional)
+    # AOAI generation: prefer structured JSON per prompt
     try:
-        evidence_lines = []
-        for i, d in enumerate(full_docs, start=1):
-            evidence_lines.append(f"=== Documento #{i} ===")
-            evidence_lines.append(f"id: {d.get('id')}")
-            evidence_lines.append(f"title: {d.get('doc_title') or d.get('title')}")
-            evidence_lines.append(f"source: {d.get('source_file') or d.get('source')}")
-            evidence_lines.append(f"snippet: {(d.get('text') or '')[:2000]}")
-            evidence_lines.append("\n")
-        save_file("/tmp/evidence.txt", "\n".join(evidence_lines))
-    except Exception:
-        pass
-
-    # 3) Reranking + generate via AOAI Chat
-    try:
-        system_prompt, user_prompt = build_rerank_prompt(query, full_docs[:3])
+        system_prompt, user_prompt = build_rerank_prompt(query, full_docs[:5])
         chat_resp = call_aoai_chat(system_prompt, user_prompt)
-        content = extract_chat_content(chat_resp)
-        parsed = parse_json_from_text(content)
+        raw_content = extract_chat_content(chat_resp)
+        logger.debug("AOAI raw content: %s", to_str_safe(raw_content, 2000))
+        parsed = parse_json_from_text(raw_content)
+        # normalize parsed result
         if isinstance(parsed, dict):
-            response_payload["answer"] = parsed
+            # ensure keys
+            if "text" not in parsed and "answer" in parsed:
+                parsed = {"text": parsed.get("answer"), **{k: v for k, v in parsed.items() if k != "answer"}}
+            result["answer"] = parsed
+        elif isinstance(parsed, list):
+            result["answer"] = {"text": json.dumps(parsed, ensure_ascii=False), "bullets": []}
         else:
-            response_payload["answer"] = {"text": to_str_safe(parsed)}
+            # numbers or strings -> wrap
+            result["answer"] = {"text": to_str_safe(parsed), "bullets": []}
     except Exception as e:
-        logging.warning(f"Erro na geração via AOAI Chat: {e}")
-        summary_lines = []
-        for idx, h in enumerate(full_docs, start=1):
-            s = (h.get("text") or "").replace("\n", " ")
-            one_line = (s[:300] + "...") if s else ""
-            summary_lines.append(f"{idx}. Fonte: {h.get('source_file')} (chunk={h.get('chunk')})\n{one_line}")
-        fallback_answer = "Resumo dos principais trechos encontrados:\n\n" + "\n\n".join(summary_lines)
-        fallback_answer += "\n\nRecomendações: 1) Abrir chamado no Portal de Atendimento e anexar evidências. 2) Informar unidade/setor e nível de prioridade."
-        response_payload["answer"] = {"text": fallback_answer}
-        response_payload["gen_error"] = str(e)
+        logger.warning("AOAI generation failed: %s", e)
+        # fallback: try quick synthesizer or build minimal summary
+        try:
+            synth = synthesize_answer(query, full_docs[:5])
+            # if synth returned something likely textual, wrap into JSON
+            result["answer"] = {"text": synth, "bullets": []}
+            result["generation_error"] = to_str_safe(e)
+        except Exception as e2:
+            # ultimate fallback: concatenate first paragraphs
+            summary_lines = []
+            for idx, d in enumerate(full_docs[:5], start=1):
+                t = d.get("text") or ""
+                one = (t.replace("\n", " ")[:400] + "...") if t else ""
+                summary_lines.append(f"{idx}. {one} (id={d.get('id')})")
+            fallback = "Resumo fallback basado nos documentos encontrados:\n\n" + "\n\n".join(summary_lines)
+            result["answer"] = {"text": fallback}
+            result["generation_error"] = to_str_safe(e)
 
     if debug:
-        response_payload["debug"] = {
-            "embed_used": response_payload.get("used_embedding"),
-            "fallback_to_text": response_payload.get("fallback_to_text"),
-            "embed_error": response_payload.get("embed_error"),
-        }
-
-    return response_payload
+        result["debug"] = {"used_embedding": result.get("used_embedding"), "fallback_to_text": result.get("fallback_to_text"), "hits_count": result.get("hits_count")}
+    return result
 
 
-@app.route(route="search/obras", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
-def semantic_search_obras(req: func.HttpRequest) -> func.HttpResponse:
-    try:
-        body = req.get_json() if req.get_body() else {}
-    except Exception:
-        body = {}
-
-    query = (body.get("query") or "").strip()
-    if not query:
-        return func.HttpResponse(json.dumps({"error": "missing 'query' in body"}, ensure_ascii=False), status_code=400, mimetype="application/json")
-
-    requested_topk = int(body.get("topK", DEFAULT_TOPK))
-    topk = min(requested_topk, MAX_TOPK)
-    debug = bool(body.get("debug", False))
-
-    response_payload: Dict[str, Any] = {
-        "query": query,
-        "topK": topk,
-        "used_embedding": False,
-        "fallback_to_text": False,
-        "hits_count": 0,
-        "hits": [],
-        "answer": None,
-        "debug": None
+# ---------------------------
+# Public API for Azure Function wrapper (compact output)
+# ---------------------------
+def _make_compact_response(full: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extrai somente os campos que o usuário pediu.
+    """
+    return {
+        "query": full.get("query"),
+        "topK": full.get("topK"),
+        "used_embedding": bool(full.get("used_embedding")),
+        "fallback_to_text": bool(full.get("fallback_to_text")),
+        "hits_count": int(full.get("hits_count", 0)),
+        "answer": full.get("answer")
     }
 
-    # 1) Embedding + vector search (preferred)
-    embedding = None
+def generate_client_response(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Entrada: body JSON do POST.
+    - body["query"] - string
+    - body["topK"] (opcional)
+    - body["debug"] (opcional)
+    - body["compact"] (opcional, default True) -> se False, retorna o objeto completo
+    """
+    query = ""
     try:
-        embedding = get_embedding(query)
-        response_payload["used_embedding"] = True
-    except Exception as e:
-        logging.warning(f"Erro gerando embedding: {e}")
-        response_payload["embed_error"] = str(e)
-
-    search_json = None
-    try:
-        if embedding:
-            try:
-                search_json = search_vector(embedding, topk=topk)
-            except Exception as ve:
-                logging.warning(f"Vector search failed: {ve} — falling back to text search")
-                response_payload["fallback_to_text"] = True
-                search_json = text_search(query, topk=topk)
-        else:
-            response_payload["fallback_to_text"] = True
-            search_json = text_search(query, topk=topk)
-
-        hits = parse_search_hits(search_json)
-        hits = dedupe_results(hits)
-        response_payload["hits_count"] = len(hits)
-        response_payload["hits"] = hits
-        if debug:
-            response_payload["search_raw"] = search_json
-
-    except Exception as e_search:
-        logging.exception("Erro na chamada ao Azure Search")
-        return func.HttpResponse(json.dumps({"error": f"Erro na busca: {e_search}"}, ensure_ascii=False), status_code=500, mimetype="application/json")
-
-    # 2) Try to fetch full docs for top hits (best-effort)
-    full_docs = []
-    for r in response_payload["hits"][:min(5, topk)]:
-        doc_id = r.get("id")
-        if doc_id:
-            try:
-                doc_full = get_doc_by_id(doc_id)
-                if isinstance(doc_full, dict) and doc_full.get("id"):
-                    combined = {**r, **doc_full}
-                    full_docs.append(combined)
-                else:
-                    r["_fetch_error"] = doc_full
-                    full_docs.append(r)
-            except Exception as e:
-                r["_fetch_error"] = str(e)
-                full_docs.append(r)
-        else:
-            full_docs.append(r)
-
-    # Save evidence file (optional, non-critical)
-    try:
-        evidence_lines = []
-        for i, d in enumerate(full_docs, start=1):
-            evidence_lines.append(f"=== Documento #{i} ===")
-            evidence_lines.append(f"id: {d.get('id')}")
-            evidence_lines.append(f"title: {d.get('doc_title') or d.get('title')}")
-            evidence_lines.append(f"source: {d.get('source_file') or d.get('source')}")
-            evidence_lines.append(f"snippet: {(d.get('text') or '')[:2000]}")
-            evidence_lines.append("\n")
-        save_file("/tmp/evidence.txt", "\n".join(evidence_lines))
+        query = (body.get("query") or body.get("q") or "").strip()
     except Exception:
-        pass
-
-    # 3) Reranking + generate via AOAI Chat
+        query = ""
     try:
-        system_prompt, user_prompt = build_rerank_prompt(query, full_docs[:3])
-        chat_resp = call_aoai_chat(system_prompt, user_prompt)
-        content = extract_chat_content(chat_resp)
-        parsed = parse_json_from_text(content)
-        # ensure result is dict with expected fields; otherwise fallback to raw text
-        if isinstance(parsed, dict):
-            response_payload["answer"] = parsed
-        else:
-            response_payload["answer"] = {"text": to_str_safe(parsed)}
+        topk = int(body.get("topK", body.get("topk", DEFAULT_TOPK)))
+    except Exception:
+        topk = DEFAULT_TOPK
+    topk = max(1, min(MAX_TOPK, topk))
+    debug = bool(body.get("debug", False))
+    compact = body.get("compact", True)  # default: True -> retorna só o resumo
+    try:
+        full_resp = process_query(query, topk=topk, debug=debug)
     except Exception as e:
-        logging.warning(f"Erro na geração via AOAI Chat: {e}")
-        # fallback: build a quick summary
-        summary_lines = []
-        for idx, h in enumerate(full_docs, start=1):
-            s = (h.get("text") or "").replace("\n", " ")
-            one_line = (s[:300] + "...") if s else ""
-            summary_lines.append(f"{idx}. Fonte: {h.get('source_file')} (chunk={h.get('chunk')})\n{one_line}")
-        fallback_answer = "Resumo dos principais trechos encontrados:\n\n" + "\n\n".join(summary_lines)
-        # some pragmatic recommendations
-        fallback_answer += "\n\nRecomendações: 1) Abrir chamado no Portal de Atendimento e anexar evidências. 2) Informar unidade/setor e nível de prioridade."
-        response_payload["answer"] = {"text": fallback_answer}
-        response_payload["gen_error"] = str(e)
+        logger.exception("generate_client_response failed")
+        return {"error": to_str_safe(e), "status": 500}
 
-    if debug:
-        response_payload["debug"] = {
-            "embed_used": response_payload.get("used_embedding"),
-            "fallback_to_text": response_payload.get("fallback_to_text"),
-            "embed_error": response_payload.get("embed_error"),
-        }
+    # se pedirem explicitamente o objeto completo, devolve tudo (útil para debug)
+    if compact in (False, "false", "False", 0, "0"):
+        return full_resp
 
-    return func.HttpResponse(json.dumps(response_payload, ensure_ascii=False, indent=2), status_code=200, mimetype="application/json")
+    # caso contrário devolve só os campos resumidos
+    compacted = _make_compact_response(full_resp)
+    return compacted
+
+
+def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    função wrapper usada pela Azure Function (ex: __init__.py chama handle_search_request(body))
+    """
+    return generate_client_response(body)
+
+
+if __name__ == "__main__":
+    test_q = "Qual é a previsão para o projeto de obras na avenida X?"
+    print("Running quick local test (no network checks).")
+    try:
+        out = process_query(test_q, topk=3, debug=True)
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+    except Exception as e:
+        logger.exception("Local test failed: %s", e)
+        print({"error": str(e)})

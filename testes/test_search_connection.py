@@ -26,7 +26,7 @@ def get(url, headers, what):
 
 def main():
     ap = argparse.ArgumentParser(description="Teste de conexão com Azure AI Search")
-    ap.add_argument("--search-endpoint", required=True, help="https://see-h-ai-crm-searchbot.search.windows.net")
+    ap.add_argument("--search-endpoint", required=True, help="endpoint")
     ap.add_argument("--search-api-key", required=True, help="API-Key")
     ap.add_argument("--api-version", default=API_VERSION)
     args = ap.parse_args()
