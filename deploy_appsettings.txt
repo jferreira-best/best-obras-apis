@@ -1,0 +1,148 @@
+<#
+deploy_appsettings.ps1
+Atualiza application settings da Function App e opcionalmente faz zip-deploy do código.
+Usage:
+  # Apenas atualizar settings
+  .\deploy_appsettings.ps1
+
+  # Atualizar settings + zip deploy
+  .\deploy_appsettings.ps1 -ZipDeploy $true
+#>
+
+param(
+  [string]$ResourceGroup = "RG-SEE-D-FUNCTION",
+  [string]$FunctionApp = "see-d-crm-orquestradorbot",
+  [switch]$ZipDeploy = $false,
+  [string]$PackageName = "package.zip"
+)
+
+function FailIf($msg) {
+  Write-Error $msg
+  exit 1
+}
+
+# Pré-requisitos
+if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+  FailIf "Azure CLI não encontrado. Instale/atualize o 'az' e faça 'az login'."
+}
+
+# Confirma se está logado
+$accountJson = az account show --only-show-errors 2>&1
+if ($LASTEXITCODE -ne 0) { FailIf "Não foi possível obter a subscription. Faça 'az login'." }
+$account = $accountJson | ConvertFrom-Json
+if (-not $account) { FailIf "Você não está logado no Azure CLI. Rode 'az login' primeiro." }
+Write-Host "Subscription: $($account.name) ($($account.id))"
+
+# 2) Ler local.settings.json se existir e aplicar como app settings (valores em Values)
+$localSettingsPath = Join-Path (Get-Location) "local.settings.json"
+$settingsToSet = @{}
+
+if (Test-Path $localSettingsPath) {
+  Write-Host "local.settings.json encontrado - preparando para atualizar Application Settings (valores em 'Values')."
+  try {
+    $json = Get-Content $localSettingsPath -Raw | ConvertFrom-Json
+    if ($json.Values) {
+      foreach ($k in $json.Values.PSObject.Properties.Name) {
+        $v = $json.Values.$k
+        if ($null -ne $v) {
+          $settingsToSet[$k] = $v
+        }
+      }
+    }
+  } catch {
+    Write-Warning "Erro ao ler local.settings.json: $_. Continuando sem aplicar settings locais."
+  }
+} else {
+  Write-Host "local.settings.json NÃO encontrado na pasta atual - pulando leitura de settings locais."
+}
+
+# 3) Forçar build remoto durante deploy (recomendado para Python)
+$settingsToSet["SCM_DO_BUILD_DURING_DEPLOYMENT"] = "true"
+$settingsToSet["FUNCTIONS_WORKER_RUNTIME"] = "python"
+
+# 4) Aplicar settings via az
+if ($settingsToSet.Count -gt 0) {
+  $settingsArray = @()
+  foreach ($k in $settingsToSet.Keys) {
+    $settingsArray += "$k=$($settingsToSet[$k])"
+  }
+  Write-Host "Aplicando Application Settings para $FunctionApp..."
+  $apply = az functionapp config appsettings set --name $FunctionApp --resource-group $ResourceGroup --settings $settingsArray --only-show-errors 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warning "Falha ao aplicar app settings:`n$apply"
+  } else {
+    Write-Host "App settings atualizados."
+  }
+} else {
+  Write-Host "Nenhuma app setting a aplicar."
+}
+
+# 5) Opcional: zip-deploy do código (com fallback para run-from-package)
+if ($ZipDeploy) {
+  Write-Host "Preparando package.zip para zip-deploy..."
+
+  $cwd = Get-Location
+  $packagePath = Join-Path $cwd.Path $PackageName
+
+  if (Test-Path $packagePath) { Remove-Item $packagePath -Force }
+
+  # Monta lista de arquivos a incluir (exclui local.settings.json, venv, .venv, .git, __pycache__)
+  $exclusionRegex = 'local.settings.json|[\\/]venv[\\/]|[\\/]\\.venv[\\/]|[\\/]\\.git[\\/]|__pycache__'
+  $files = Get-ChildItem -Recurse -File | Where-Object { $_.FullName -notmatch $exclusionRegex } | ForEach-Object { $_.FullName }
+
+  if (-not $files) { FailIf "Nenhum arquivo encontrado para empacotar." }
+
+  Compress-Archive -Path $files -DestinationPath $packagePath -Force
+
+  if (-not (Test-Path $packagePath)) {
+    FailIf "Falha ao criar $packagePath"
+  }
+
+  Write-Host "Arquivo $packagePath criado. Iniciando zip-deploy..."
+  $deployOut = az functionapp deployment source config-zip --resource-group $ResourceGroup --name $FunctionApp --src $packagePath --only-show-errors 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warning "Zip deploy retornou erro:`n$deployOut"
+    Write-Host "Tentando fallback: upload para Storage e aplicar WEBSITE_RUN_FROM_PACKAGE..."
+
+    # pegar AzureWebJobsStorage
+    $settingsJson = az functionapp config appsettings list --name $FunctionApp --resource-group $ResourceGroup --only-show-errors 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Não foi possível obter app settings para fallback."; goto RestartAndExit }
+    $settingsList = $settingsJson | ConvertFrom-Json
+    $awsEntry = $settingsList | Where-Object { $_.name -eq "AzureWebJobsStorage" }
+    if (-not $awsEntry) { Write-Warning "AzureWebJobsStorage não encontrado. Fallback abortado."; goto RestartAndExit }
+    $aws = $awsEntry.value
+
+    if ($aws -match "AccountName=([^;]+)") { $storageAccount = $matches[1] } else { Write-Warning "Não foi possível extrair AccountName do connection string. Fallback abortado."; goto RestartAndExit }
+
+    $containerName = "function-deploy"
+    az storage container create --account-name $storageAccount --name $containerName --auth-mode key --only-show-errors 2>&1 | Out-Null
+    az storage blob upload --account-name $storageAccount --container-name $containerName --file $packagePath --name package.zip --auth-mode key --only-show-errors 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Falha no upload para Storage. Fallback abortado."; goto RestartAndExit }
+
+    # gerar SAS curto e aplicar
+    $expiry = (Get-Date).AddDays(1).ToString("yyyy-MM-ddTHH:mmZ")
+    $sas = az storage blob generate-sas --account-name $storageAccount --container-name $containerName --name package.zip --permissions r --expiry $expiry --auth-mode key -o tsv 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Falha ao gerar SAS. Fallback abortado."; goto RestartAndExit }
+
+    $blobUrl = "https://$storageAccount.blob.core.windows.net/$containerName/package.zip`?$sas"
+    az functionapp config appsettings set --name $FunctionApp --resource-group $ResourceGroup --settings "WEBSITE_RUN_FROM_PACKAGE=$blobUrl" --only-show-errors 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Falha ao aplicar WEBSITE_RUN_FROM_PACKAGE."; goto RestartAndExit }
+
+    Write-Host "Fallback via run-from-package aplicado. URL: $blobUrl"
+  } else {
+    Write-Host "Zip deploy concluído com sucesso."
+  }
+
+  :RestartAndExit
+}
+
+# 6) Reiniciar a Function App para garantir reload (opcional)
+Write-Host "Reiniciando Function App..."
+$restartOut = az functionapp restart --name $FunctionApp --resource-group $ResourceGroup --only-show-errors 2>&1
+if ($LASTEXITCODE -ne 0) {
+  Write-Warning "Restart retornou erro:`n$restartOut"
+} else {
+  Write-Host "Function App reiniciada."
+}
+
+Write-Host "Done."

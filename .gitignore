@@ -71,6 +71,14 @@ cache/
 # Git
 *.patch
 
+# Ignorar configurações locais e segredos
+local.settings.json
+*.bak
+
+# Ignorar pacotes e zips
+*.zip
+package.zip
+
 # Other common
 node_modules/
 npm-debug.log*
