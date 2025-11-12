@@ -13,7 +13,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     except ValueError:
         body = {k: v for k, v in req.params.items()}
         if not body:
-            body = {} # Garante que 'body' seja um dict
+            body = {} # Garante que 'body' seja um dict  vai porcaroa
 
     try:
         # --- ESTA É A CHAMADA PRINCIPAL ---
