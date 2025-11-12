@@ -26,6 +26,16 @@ import requests
 logger = logging.getLogger("function_app_debug")
 logger.setLevel(logging.INFO)
 
+def _safe_int_env(key: str, default: int) -> int:
+    val = os.environ.get(key)
+    if val is None or val == "":
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        logging.error("ERROR: Environment variable %s has invalid value '%s'. Using default %d.", key, val, default)
+        return default
+
 def _mask_secret(s: str) -> str:
     if not s:
         return "(empty)"
@@ -80,35 +90,35 @@ def log_config(debug_flag: bool=False) -> None:
         logger.info("Note: code checks both SEARCH_* and COG_* names, and OPENAI_* and AOAI_* groups.")
 
 # --- Config / environment (ajuste conforme seu ambiente) ---
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = _safe_int_env("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL))
 logger = logging.getLogger(__name__)
 
-COG_SEARCH_ENDPOINT    = os.environ.get("COG_SEARCH_ENDPOINT", "").rstrip("/")
-COG_SEARCH_KEY         = os.environ.get("COG_SEARCH_KEY", "")
-COG_SEARCH_INDEX       = os.environ.get("COG_SEARCH_INDEX", "")
-COG_SEARCH_API_VERSION = os.environ.get("COG_SEARCH_API_VERSION", "2024-07-01")
-DEFAULT_TOPK           = int(os.environ.get("DEFAULT_TOPK", "6"))
+COG_SEARCH_ENDPOINT    = _safe_int_env("COG_SEARCH_ENDPOINT", "").rstrip("/")
+COG_SEARCH_KEY         = _safe_int_env("COG_SEARCH_KEY", "")
+COG_SEARCH_INDEX       = _safe_int_envt("COG_SEARCH_INDEX", "")
+COG_SEARCH_API_VERSION = _safe_int_envt("COG_SEARCH_API_VERSION", "2024-07-01")
+DEFAULT_TOPK           = _safe_int_env("DEFAULT_TOPK", "6")
 
-ENABLE_SEMANTIC       = os.environ.get("ENABLE_SEMANTIC", "true").lower() in ("1","true","yes","on")
-COG_SEARCH_SEM_CONFIG = os.environ.get("COG_SEARCH_SEM_CONFIG", "")
+ENABLE_SEMANTIC       = _safe_int_env("ENABLE_SEMANTIC", "true").lower() in ("1","true","yes","on")
+COG_SEARCH_SEM_CONFIG = _safe_int_env("COG_SEARCH_SEM_CONFIG", "")
 
-SEARCH_FIELDS         = os.environ.get("SEARCH_FIELDS", "doc_title,text")
+SEARCH_FIELDS         = _safe_int_env("SEARCH_FIELDS", "doc_title,text")
 
-AOAI_ENDPOINT       = os.environ.get("AOAI_ENDPOINT", "").rstrip("/")
-AOAI_API_KEY        = os.environ.get("AOAI_API_KEY", "")
-AOAI_EMB_DEPLOYMENT = os.environ.get("AOAI_EMB_DEPLOYMENT", "")
-AOAI_CHAT_DEPLOYMENT = os.environ.get("AOAI_CHAT_DEPLOYMENT", "")
-AOAI_API_VERSION    = os.environ.get("AOAI_API_VERSION", "2023-10-01")
-EMBED_DIM           = int(os.environ.get("EMBED_DIM", "3072"))
+AOAI_ENDPOINT       = _safe_int_env("AOAI_ENDPOINT", "").rstrip("/")
+AOAI_API_KEY        = _safe_int_env("AOAI_API_KEY", "")
+AOAI_EMB_DEPLOYMENT = _safe_int_env("AOAI_EMB_DEPLOYMENT", "")
+AOAI_CHAT_DEPLOYMENT = _safe_int_env("AOAI_CHAT_DEPLOYMENT", "")
+AOAI_API_VERSION    = _safe_int_env("AOAI_API_VERSION", "2023-10-01")
+EMBED_DIM           = _safe_int_env("EMBED_DIM", "3072")
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = _safe_int_env("OPENAI_API_KEY", "")
+OPENAI_MODEL   = _safe_int_env("OPENAI_MODEL", "gpt-4o-mini")
 
 # Timeouts and persistent cache file (tune as needed)
-HTTP_TIMEOUT_SHORT = int(os.environ.get("HTTP_TIMEOUT_SHORT", "8"))   # for embeddings and latency-sensitive calls
-HTTP_TIMEOUT_LONG  = int(os.environ.get("HTTP_TIMEOUT_LONG", "20"))  # for searches/LLM longer calls
-EMB_CACHE_FILE     = os.environ.get("EMB_CACHE_FILE", "/tmp/emb_cache.db")
+HTTP_TIMEOUT_SHORT = _safe_int_env("HTTP_TIMEOUT_SHORT", "8")   # for embeddings and latency-sensitive calls
+HTTP_TIMEOUT_LONG  = _safe_int_env("HTTP_TIMEOUT_LONG", "20")  # for searches/LLM longer calls
+EMB_CACHE_FILE     = _safe_int_env("EMB_CACHE_FILE", "/tmp/emb_cache.db")
 
 # small util constants
 STOPWORDS = {
@@ -1096,7 +1106,7 @@ def _add_query_doc_cooccurrence(nhits: List[Dict[str, Any]], quotes: List[Dict[s
                 spans_list.append((t, sp[0], sp[1]))
         spans_list.sort(key=lambda x: x[1])
         found_pair_ctx = None
-        char_window_size = int(os.environ.get("COOC_CHAR_WINDOW", "300"))
+        char_window_size = _safe_int_env("COOC_CHAR_WINDOW", "300")
         for i in range(len(spans_list)):
             t1, s1, e1 = spans_list[i]
             for j in range(i+1, min(i+6, len(spans_list))):
@@ -1367,7 +1377,7 @@ def _is_short_def_query(query: str) -> bool:
 # --- if used as script locally for quick test
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    test_query = os.environ.get("TEST_QUERY", "O que é uma Demanda nova?")
+    test_query = _safe_int_env("TEST_QUERY", "O que é uma Demanda nova?")
     body = {"query": test_query, "topK": 6, "debug": True}
     out = handle_search_request(body)
     print(json.dumps(out, ensure_ascii=False, indent=2))
