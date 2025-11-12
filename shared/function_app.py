@@ -186,19 +186,19 @@ def _embedding_or_none(text: str) -> Optional[List[float]]:
 
 # --- persisted cache helpers (shelve) + LRU wrapper ---
 def _persisted_embedding(q: str) -> Optional[Tuple[float, ...]]:
-    try:
-        with shelve.open(EMB_CACHE_FILE) as db:
-            val = db.get(q)
-            return tuple(val) if val else None
-    except Exception:
-        return None
+   # try:
+    #    with shelve.open(EMB_CACHE_FILE) as db:
+    #        val = db.get(q)
+    #        return tuple(val) if val else None
+    #except Exception:
+    return None
 
 def _store_persisted_embedding(q: str, tup: Tuple[float, ...]):
-    try:
-        with shelve.open(EMB_CACHE_FILE) as db:
-            db[q] = list(tup)
-    except Exception:
-        pass
+    #try:
+    #    with shelve.open(EMB_CACHE_FILE) as db:
+    #        db[q] = list(tup)
+    #except Exception:
+    pass
 
 @lru_cache(maxsize=1024)
 def _cached_query_embedding_tuple(q: str) -> Optional[Tuple[float, ...]]:
