@@ -33,8 +33,17 @@ def _safe_int_env(key: str, default: int) -> int:
     try:
         return int(val)
     except ValueError:
-        logging.error("ERROR: Environment variable %s has invalid value '%s'. Using default %d.", key, val, default)
+        # AQUI: Mudança de %d para %s, pois 'default' pode ser uma string (como 'INFO')
+        logging.error("ERROR: Environment variable %s has invalid value '%s'. Using default %s.", key, val, default)
         return default
+
+def _safe_str_env(key: str, default: str) -> str:
+    """Retorna o valor da variável de ambiente como string ou o default."""
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    # Se a intenção é retornar sempre uma string (e não um int), não há try/except de int
+    return val
 
 def _mask_secret(s: str) -> str:
     if not s:
@@ -90,35 +99,59 @@ def log_config(debug_flag: bool=False) -> None:
         logger.info("Note: code checks both SEARCH_* and COG_* names, and OPENAI_* and AOAI_* groups.")
 
 # --- Config / environment (ajuste conforme seu ambiente) ---
-LOG_LEVEL = _safe_int_env("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = _safe_str_env("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL))
 logger = logging.getLogger(__name__)
 
-COG_SEARCH_ENDPOINT    = _safe_int_env("COG_SEARCH_ENDPOINT", "").rstrip("/")
-COG_SEARCH_KEY         = _safe_int_env("COG_SEARCH_KEY", "")
-COG_SEARCH_INDEX       = _safe_int_envt("COG_SEARCH_INDEX", "")
-COG_SEARCH_API_VERSION = _safe_int_envt("COG_SEARCH_API_VERSION", "2024-07-01")
-DEFAULT_TOPK           = _safe_int_env("DEFAULT_TOPK", "6")
+# COG_SEARCH_ENDPOINT é uma string (deve usar _safe_str_env)
+COG_SEARCH_ENDPOINT    = _safe_str_env("COG_SEARCH_ENDPOINT", "").rstrip("/")
+# COG_SEARCH_KEY é uma string (deve usar _safe_str_env)
+COG_SEARCH_KEY         = _safe_str_env("COG_SEARCH_KEY", "")
+# COG_SEARCH_INDEX é uma string (deve usar _safe_str_env)
+# **CORREÇÃO:** Substituir o uso da função inexistente '_safe_int_envt' por '_safe_str_env'
+COG_SEARCH_INDEX       = _safe_str_env("COG_SEARCH_INDEX", "")
 
-ENABLE_SEMANTIC       = _safe_int_env("ENABLE_SEMANTIC", "true").lower() in ("1","true","yes","on")
-COG_SEARCH_SEM_CONFIG = _safe_int_env("COG_SEARCH_SEM_CONFIG", "")
+# COG_SEARCH_API_VERSION é uma string (deve usar _safe_str_env)
+# **CORREÇÃO:** Substituir o uso da função inexistente '_safe_int_envt' por '_safe_str_env'
+COG_SEARCH_API_VERSION = _safe_str_env("COG_SEARCH_API_VERSION", "2024-07-01")
 
-SEARCH_FIELDS         = _safe_int_env("SEARCH_FIELDS", "doc_title,text")
+# DEFAULT_TOPK é um inteiro (mantém _safe_int_env)
+DEFAULT_TOPK           = _safe_int_env("DEFAULT_TOPK", 6) # Use 6, não "6"
 
-AOAI_ENDPOINT       = _safe_int_env("AOAI_ENDPOINT", "").rstrip("/")
-AOAI_API_KEY        = _safe_int_env("AOAI_API_KEY", "")
-AOAI_EMB_DEPLOYMENT = _safe_int_env("AOAI_EMB_DEPLOYMENT", "")
-AOAI_CHAT_DEPLOYMENT = _safe_int_env("AOAI_CHAT_DEPLOYMENT", "")
-AOAI_API_VERSION    = _safe_int_env("AOAI_API_VERSION", "2023-10-01")
-EMBED_DIM           = _safe_int_env("EMBED_DIM", "3072")
 
-OPENAI_API_KEY = _safe_int_env("OPENAI_API_KEY", "")
-OPENAI_MODEL   = _safe_int_env("OPENAI_MODEL", "gpt-4o-mini")
+# function_app.py (Chamadas Corrigidas)
 
-# Timeouts and persistent cache file (tune as needed)
-HTTP_TIMEOUT_SHORT = _safe_int_env("HTTP_TIMEOUT_SHORT", "8")   # for embeddings and latency-sensitive calls
-HTTP_TIMEOUT_LONG  = _safe_int_env("HTTP_TIMEOUT_LONG", "20")  # for searches/LLM longer calls
-EMB_CACHE_FILE     = _safe_int_env("EMB_CACHE_FILE", "/tmp/emb_cache.db")
+# Variável de controle booleana
+# Deve usar _safe_str_env, pois o valor é a string "true"
+ENABLE_SEMANTIC       = _safe_str_env("ENABLE_SEMANTIC", "true").lower() in ("1","true","yes","on")
+# Variável de string (configuração)
+COG_SEARCH_SEM_CONFIG = _safe_str_env("COG_SEARCH_SEM_CONFIG", "")
+
+# Variável de string (lista de campos)
+SEARCH_FIELDS         = _safe_str_env("SEARCH_FIELDS", "doc_title,text")
+
+# Variáveis de string (Endpoints e Chaves)
+AOAI_ENDPOINT       = _safe_str_env("AOAI_ENDPOINT", "").rstrip("/")
+AOAI_API_KEY        = _safe_str_env("AOAI_API_KEY", "")
+AOAI_EMB_DEPLOYMENT = _safe_str_env("AOAI_EMB_DEPLOYMENT", "")
+AOAI_CHAT_DEPLOYMENT = _safe_str_env("AOAI_CHAT_DEPLOYMENT", "")
+AOAI_API_VERSION    = _safe_str_env("AOAI_API_VERSION", "2023-10-01")
+
+# Variável de inteiro (dimensão do embedding)
+# CORREÇÃO: Use 3072 (inteiro), não "3072" (string)
+EMBED_DIM           = _safe_int_env("EMBED_DIM", 3072)
+
+# Variáveis de string (Chaves e Modelos)
+OPENAI_API_KEY = _safe_str_env("OPENAI_API_KEY", "")
+OPENAI_MODEL   = _safe_str_env("OPENAI_MODEL", "gpt-4o-mini")
+
+# Variáveis de inteiro (Timeouts)
+# CORREÇÃO: Use 8 e 20 (inteiros), não "8" e "20" (strings)
+HTTP_TIMEOUT_SHORT = _safe_int_env("HTTP_TIMEOUT_SHORT", 8)   # for embeddings and latency-sensitive calls
+HTTP_TIMEOUT_LONG  = _safe_int_env("HTTP_TIMEOUT_LONG", 20)  # for searches/LLM longer calls
+
+# Variável de string (caminho do arquivo)
+EMB_CACHE_FILE     = _safe_str_env("EMB_CACHE_FILE", "/tmp/emb_cache.db")
 
 # small util constants
 STOPWORDS = {
