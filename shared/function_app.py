@@ -22,7 +22,7 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 import requests
 
-
+#agora vamos ver 
 logger = logging.getLogger("function_app_debug")
 logger.setLevel(logging.INFO)
 
