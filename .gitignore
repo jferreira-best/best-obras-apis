@@ -89,3 +89,9 @@ AzuriteConfig/
 __azurite_db_*.json
 __blobstorage__/
 azurite_data/
+
+
+.python_packages/
+.venv/
+__pycache__/
+*.pyc

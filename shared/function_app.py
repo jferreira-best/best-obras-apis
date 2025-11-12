@@ -20,11 +20,26 @@ from typing import Any, Dict, List, Optional, Union, Tuple
 from collections import Counter
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse, unquote
 import requests
 
 #agora vamos ver 
 logger = logging.getLogger("function_app_debug")
 logger.setLevel(logging.INFO)
+
+def _filename_from_source(src: str) -> str:
+    """Retorna apenas o nome do arquivo, vindo de path local ou URL."""
+    if not src:
+        return ""
+    # URL -> pega o path e o basename
+    if src.startswith(("http://", "https://")):
+        path = urlparse(src).path  # ex.: /container/pasta/arquivo.pdf
+        name = os.path.basename(path)
+        return unquote(name) or src
+    # Caminho local (Windows/Linux)
+    norm = src.replace("\\", "/")
+    return norm.rsplit("/", 1)[-1]
+
 
 def _safe_int_env(key: str, default: int) -> int:
     val = os.environ.get(key)
@@ -1033,10 +1048,11 @@ def _answer_from_quotes(query: str, quotes: List[Dict[str, str]], sources: List[
                 summary = summary + " Quer mais detalhes? (s/n)"
 
     bullets = _build_bullets_from_quotes(quotes, max_bullets=3)
+    src_names = [_filename_from_source(s) for s in (sources or [])]
     return {
         "text": summary,
         #"bullets": bullets,
-        "sources": sources or [],
+        "sources": src_names[:10],
         #"quotes": quotes or [],
         "meta": {"tried_completion": tried_completion, "quotes_count": len(quotes)}
     }

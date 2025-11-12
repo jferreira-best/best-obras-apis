@@ -1,0 +1,84 @@
+name: Build & Deploy Azure Functions (Python)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+  ZIP_NAME: "release.zip"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      # 🔒 Pin de versões estáveis (ajuste no seu requirements.txt):
+      # grpcio==1.62.2
+      # protobuf==4.25.3
+      - name: Install dependencies into .python_packages
+        run: |
+          mkdir -p .python_packages/lib/site-packages
+          python -m pip install --no-cache-dir -r requirements.txt \
+            --target .python_packages/lib/site-packages
+
+      - name: Sanity check (grpc/protobuf)
+        run: |
+          python - << 'PY'
+          import sys
+          sys.path.insert(0, ".python_packages/lib/site-packages")
+          import grpc, google.protobuf
+          print("python:", sys.version)
+          print("grpc:", grpc.__version__)
+          print("protobuf OK")
+          PY
+
+      - name: Create ZIP (app package)
+        run: |
+          zip -r ${{ env.ZIP_NAME }} . \
+            -x ".git/*" ".github/*" ".venv/*" "env/*" "__pycache__/*" \
+               "*.pyc" "*.pyo" "*.pyd" ".pytest_cache/*" "tests/*" \
+               "wheels/*"
+
+      - name: Upload artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: functionapp
+          path: ${{ env.ZIP_NAME }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: functionapp
+          path: .
+
+      # Deploy com publish profile do App Service/Function App
+      - name: Deploy to Azure (Zip Deploy)
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_NAME }}   # ex.: see-d-crm-orquestradorbot
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISH_PROFILE }}
+          package: ${{ env.ZIP_NAME }}
