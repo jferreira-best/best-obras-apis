@@ -1,4 +1,12 @@
-# function_app.py — versão completa com _find_explicit_policy_statements definido
+# function_app.py
+# Versão completa e consolidada — inclui:
+# - prompt PRINCIPAL (resposta objetiva 1 parágrafo)
+# - detecção/compleção de truncamento LLM
+# - cache LRU + persistente (shelve) de embeddings
+# - execução paralela de vector + text search com timeouts
+# - timeouts configuráveis (HTTP_TIMEOUT_SHORT/HTTP_TIMEOUT_LONG)
+# - fallback text-only se embedding falhar
+# - preserva lógica original de scoring/extração/co-occurrence
 
 import os
 import json
@@ -15,21 +23,23 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, unquote
 import requests
 
-# =========================
-# LOG
-# =========================
+#agora vamos ver 
 logger = logging.getLogger("function_app_debug")
 logger.setLevel(logging.INFO)
 
 def _filename_from_source(src: str) -> str:
+    """Retorna apenas o nome do arquivo, vindo de path local ou URL."""
     if not src:
         return ""
+    # URL -> pega o path e o basename
     if src.startswith(("http://", "https://")):
-        path = urlparse(src).path
+        path = urlparse(src).path  # ex.: /container/pasta/arquivo.pdf
         name = os.path.basename(path)
         return unquote(name) or src
+    # Caminho local (Windows/Linux)
     norm = src.replace("\\", "/")
     return norm.rsplit("/", 1)[-1]
+
 
 def _safe_int_env(key: str, default: int) -> int:
     val = os.environ.get(key)
@@ -38,13 +48,16 @@ def _safe_int_env(key: str, default: int) -> int:
     try:
         return int(val)
     except ValueError:
+        # AQUI: Mudança de %d para %s, pois 'default' pode ser uma string (como 'INFO')
         logging.error("ERROR: Environment variable %s has invalid value '%s'. Using default %s.", key, val, default)
         return default
 
 def _safe_str_env(key: str, default: str) -> str:
+    """Retorna o valor da variável de ambiente como string ou o default."""
     val = os.environ.get(key)
     if val is None:
         return default
+    # Se a intenção é retornar sempre uma string (e não um int), não há try/except de int
     return val
 
 def _mask_secret(s: str) -> str:
@@ -56,15 +69,26 @@ def _mask_secret(s: str) -> str:
     return s[:6] + "..." + s[-4:]
 
 def resolve_env_map() -> Dict[str, Any]:
+    """
+    Resolve as variáveis relevantes tentando nomes alternativos (fallbacks).
+    Retorne dict com todas as keys que seu código usa.
+    """
     env = os.environ
-    SEARCH_ENDPOINT     = env.get("SEARCH_ENDPOINT") or env.get("COG_SEARCH_ENDPOINT")
-    SEARCH_API_KEY      = env.get("SEARCH_API_KEY") or env.get("COG_SEARCH_KEY")
-    SEARCH_INDEX        = env.get("SEARCH_INDEX") or env.get("COG_SEARCH_INDEX") or env.get("SEARCH_INDEX")
-    OPENAI_API_BASE     = env.get("OPENAI_API_BASE") or env.get("AOAI_ENDPOINT") or env.get("AZURE_OPENAI_ENDPOINT")
-    OPENAI_API_KEY      = env.get("OPENAI_API_KEY") or env.get("AOAI_API_KEY") or env.get("AZURE_OPENAI_KEY")
-    OPENAI_DEPLOYMENT   = env.get("OPENAI_DEPLOYMENT") or env.get("AOAI_CHAT_DEPLOYMENT") or env.get("OPENAI_CHAT_DEPLOYMENT")
+
+    # Search / Cognitive Search
+    SEARCH_ENDPOINT = env.get("SEARCH_ENDPOINT") or env.get("COG_SEARCH_ENDPOINT")
+    SEARCH_API_KEY = env.get("SEARCH_API_KEY") or env.get("COG_SEARCH_KEY")
+    SEARCH_INDEX = env.get("SEARCH_INDEX") or env.get("COG_SEARCH_INDEX") or env.get("SEARCH_INDEX")
+
+    # OpenAI / AOAI
+    OPENAI_API_BASE = env.get("OPENAI_API_BASE") or env.get("AOAI_ENDPOINT") or env.get("AZURE_OPENAI_ENDPOINT")
+    OPENAI_API_KEY = env.get("OPENAI_API_KEY") or env.get("AOAI_API_KEY") or env.get("AZURE_OPENAI_KEY")
+    OPENAI_DEPLOYMENT = env.get("OPENAI_DEPLOYMENT") or env.get("AOAI_CHAT_DEPLOYMENT") or env.get("OPENAI_CHAT_DEPLOYMENT")
+
+    # Generic / other
     FUNCTIONS_WORKER_RUNTIME = env.get("FUNCTIONS_WORKER_RUNTIME")
     AzureWebJobsStorage = env.get("AzureWebJobsStorage") or env.get("WEBSITE_CONTENTAZUREFILECONNECTIONSTRING")
+
     return {
         "SEARCH_ENDPOINT": SEARCH_ENDPOINT,
         "SEARCH_API_KEY": SEARCH_API_KEY,
@@ -77,67 +101,74 @@ def resolve_env_map() -> Dict[str, Any]:
     }
 
 def log_config(debug_flag: bool=False) -> None:
+    """
+    Loga as variáveis resolvidas (mascaradas). Use somente com debug.
+    """
     cfg = resolve_env_map()
     logger.info("===== CONFIG RESOLVED (masked) =====")
     for k, v in cfg.items():
         logger.info("%s = %s", k, _mask_secret(v))
     logger.info("===== END CONFIG =====")
     if debug_flag:
+        # Adicional: imprime opções de fallback que o código considera
         logger.info("Note: code checks both SEARCH_* and COG_* names, and OPENAI_* and AOAI_* groups.")
 
-# --- Config / environment ---
+# --- Config / environment (ajuste conforme seu ambiente) ---
 LOG_LEVEL = _safe_str_env("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL))
 logger = logging.getLogger(__name__)
 
+# COG_SEARCH_ENDPOINT é uma string (deve usar _safe_str_env)
 COG_SEARCH_ENDPOINT    = _safe_str_env("COG_SEARCH_ENDPOINT", "").rstrip("/")
+# COG_SEARCH_KEY é uma string (deve usar _safe_str_env)
 COG_SEARCH_KEY         = _safe_str_env("COG_SEARCH_KEY", "")
+# COG_SEARCH_INDEX é uma string (deve usar _safe_str_env)
+# **CORREÇÃO:** Substituir o uso da função inexistente '_safe_int_envt' por '_safe_str_env'
 COG_SEARCH_INDEX       = _safe_str_env("COG_SEARCH_INDEX", "")
+
+# COG_SEARCH_API_VERSION é uma string (deve usar _safe_str_env)
+# **CORREÇÃO:** Substituir o uso da função inexistente '_safe_int_envt' por '_safe_str_env'
 COG_SEARCH_API_VERSION = _safe_str_env("COG_SEARCH_API_VERSION", "2024-07-01")
 
-DEFAULT_TOPK           = _safe_int_env("DEFAULT_TOPK", 6)
+# DEFAULT_TOPK é um inteiro (mantém _safe_int_env)
+DEFAULT_TOPK           = _safe_int_env("DEFAULT_TOPK", 6) # Use 6, não "6"
 
-ENABLE_SEMANTIC        = _safe_str_env("ENABLE_SEMANTIC", "true").lower() in ("1","true","yes","on")
-COG_SEARCH_SEM_CONFIG  = _safe_str_env("COG_SEARCH_SEM_CONFIG", "")
-SEARCH_FIELDS          = _safe_str_env("SEARCH_FIELDS", "doc_title,text")
 
-AOAI_ENDPOINT          = _safe_str_env("AOAI_ENDPOINT", "").rstrip("/")
-AOAI_API_KEY           = _safe_str_env("AOAI_API_KEY", "")
-AOAI_EMB_DEPLOYMENT    = _safe_str_env("AOAI_EMB_DEPLOYMENT", "")
-AOAI_CHAT_DEPLOYMENT   = _safe_str_env("AOAI_CHAT_DEPLOYMENT", "")
-AOAI_API_VERSION       = _safe_str_env("AOAI_API_VERSION", "2023-10-01")
+# function_app.py (Chamadas Corrigidas)
 
-EMBED_DIM              = _safe_int_env("EMBED_DIM", 3072)
-OPENAI_API_KEY         = _safe_str_env("OPENAI_API_KEY", "")
-OPENAI_MODEL           = _safe_str_env("OPENAI_MODEL", "gpt-4o-mini")
+# Variável de controle booleana
+# Deve usar _safe_str_env, pois o valor é a string "true"
+ENABLE_SEMANTIC       = _safe_str_env("ENABLE_SEMANTIC", "true").lower() in ("1","true","yes","on")
+# Variável de string (configuração)
+COG_SEARCH_SEM_CONFIG = _safe_str_env("COG_SEARCH_SEM_CONFIG", "")
 
-HTTP_TIMEOUT_SHORT     = _safe_int_env("HTTP_TIMEOUT_SHORT", 8)
-HTTP_TIMEOUT_LONG      = _safe_int_env("HTTP_TIMEOUT_LONG", 20)
+# Variável de string (lista de campos)
+SEARCH_FIELDS         = _safe_str_env("SEARCH_FIELDS", "doc_title,text")
 
-EMB_CACHE_FILE         = _safe_str_env("EMB_CACHE_FILE", "/tmp/emb_cache.db")
+# Variáveis de string (Endpoints e Chaves)
+AOAI_ENDPOINT       = _safe_str_env("AOAI_ENDPOINT", "").rstrip("/")
+AOAI_API_KEY        = _safe_str_env("AOAI_API_KEY", "")
+AOAI_EMB_DEPLOYMENT = _safe_str_env("AOAI_EMB_DEPLOYMENT", "")
+AOAI_CHAT_DEPLOYMENT = _safe_str_env("AOAI_CHAT_DEPLOYMENT", "")
+AOAI_API_VERSION    = _safe_str_env("AOAI_API_VERSION", "2023-10-01")
 
-# ---------- GUARDRAILS NOVOS (menos restritivos) ----------
-RELEVANCE_THRESHOLD_HITS = float(os.getenv("RELEVANCE_THRESHOLD_HITS", "0.18"))  # era 0.28
-MIN_QUOTES_REQUIRED      = int(os.getenv("MIN_QUOTES_REQUIRED", "2"))            # era 3
-ALLOW_COMPLETION_WHEN_WEAK = os.getenv("ALLOW_COMPLETION_WHEN_WEAK", "true").lower() in ("1","true","yes","on")
+# Variável de inteiro (dimensão do embedding)
+# CORREÇÃO: Use 3072 (inteiro), não "3072" (string)
+EMBED_DIM           = _safe_int_env("EMBED_DIM", 3072)
 
-def _strip_accents(s: str) -> str:
-    if not s: 
-        return ""
-    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+# Variáveis de string (Chaves e Modelos)
+OPENAI_API_KEY = _safe_str_env("OPENAI_API_KEY", "")
+OPENAI_MODEL   = _safe_str_env("OPENAI_MODEL", "gpt-4o-mini")
 
-# Palavras do domínio (sem acentos + termos de água/solar)
-_DOMAIN_KEYWORDS_RAW = [
-    "obra","obras","manutencao","seguranca","engenharia","projeto",
-    "canteiro","nr","manual","procedimento","instalacao","elevador","incendio",
-    "aquecimento","chuva","demanda","inspecao","checklist","construcao","servicos",
-    # novos para seus casos:
-    "agua","potavel","nao potavel","qualidade","reservatorio","termico","coletores","solar","hidraulica"
-]
+# Variáveis de inteiro (Timeouts)
+# CORREÇÃO: Use 8 e 20 (inteiros), não "8" e "20" (strings)
+HTTP_TIMEOUT_SHORT = _safe_int_env("HTTP_TIMEOUT_SHORT", 8)   # for embeddings and latency-sensitive calls
+HTTP_TIMEOUT_LONG  = _safe_int_env("HTTP_TIMEOUT_LONG", 20)  # for searches/LLM longer calls
 
-DOMAIN_KEYWORDS = [k.lower() for k in _DOMAIN_KEYWORDS_RAW]
-# --------------------------------------
+# Variável de string (caminho do arquivo)
+EMB_CACHE_FILE     = _safe_str_env("EMB_CACHE_FILE", "/tmp/emb_cache.db")
 
+# small util constants
 STOPWORDS = {
     "o","a","os","as","de","do","da","dos","das","que",
     "é","e","ou","um","uma","para","por","em","no","na",
@@ -145,7 +176,7 @@ STOPWORDS = {
     "qual","quais","como","onde","quando"
 }
 
-# --- HTTP helper ---
+# --- HTTP helper with configurable default timeout ---
 def _http_post(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: int = HTTP_TIMEOUT_LONG) -> Dict[str, Any]:
     r = requests.post(url, headers=headers, json=payload, timeout=timeout)
     if r.status_code >= 400:
@@ -159,7 +190,7 @@ def _clean_text(s: str) -> str:
     s = s.replace("\r", " ")
     s = re.sub(r"\n+", " ", s)
     s = re.sub(r"\s{2,}", " ", s)
-    s = re.sub(r"(\w)-\s+(\w)", r"\1\2", s)
+    s = re.sub(r"(\w)-\s+(\w)", r"\1\2", s)  # join hyphenated line-breaks
     return s.strip()
 
 def _tokenize_pt(s: str) -> List[str]:
@@ -169,11 +200,17 @@ def _tokenize_pt(s: str) -> List[str]:
     return toks
 
 # ---------------------------------------------------------------------
-# Embeddings + cache
+# --- Embedding generation with short timeout + persisted cache wrapper
 # ---------------------------------------------------------------------
 def _embedding_or_none(text: str) -> Optional[List[float]]:
+    """
+    Generate embedding using AOAI (preferred) or fallback to public OpenAI.
+    Uses HTTP_TIMEOUT_SHORT to avoid long blocking.
+    Returns None if embedding cannot be obtained quickly.
+    """
     if not text:
         return None
+    # Try AOAI embeddings first
     try:
         if AOAI_ENDPOINT and AOAI_API_KEY and AOAI_EMB_DEPLOYMENT:
             url = f"{AOAI_ENDPOINT}/openai/deployments/{AOAI_EMB_DEPLOYMENT}/embeddings?api-version=2023-05-15"
@@ -189,6 +226,8 @@ def _embedding_or_none(text: str) -> Optional[List[float]]:
             return vec
     except Exception as e:
         logger.warning("embedding error (AOAI): %s", e)
+
+    # fallback: public OpenAI embeddings
     try:
         if OPENAI_API_KEY:
             url = "https://api.openai.com/v1/embeddings"
@@ -200,16 +239,28 @@ def _embedding_or_none(text: str) -> Optional[List[float]]:
             return data.get("data", [{}])[0].get("embedding")
     except Exception as e:
         logger.warning("embedding error (OpenAI): %s", e)
+
     return None
 
+# --- persisted cache helpers (shelve) + LRU wrapper ---
 def _persisted_embedding(q: str) -> Optional[Tuple[float, ...]]:
+   # try:
+    #    with shelve.open(EMB_CACHE_FILE) as db:
+    #        val = db.get(q)
+    #        return tuple(val) if val else None
+    #except Exception:
     return None
 
 def _store_persisted_embedding(q: str, tup: Tuple[float, ...]):
+    #try:
+    #    with shelve.open(EMB_CACHE_FILE) as db:
+    #        db[q] = list(tup)
+    #except Exception:
     pass
 
 @lru_cache(maxsize=1024)
 def _cached_query_embedding_tuple(q: str) -> Optional[Tuple[float, ...]]:
+    # fast path: persisted
     p = _persisted_embedding(q)
     if p:
         return p
@@ -224,10 +275,15 @@ def _get_query_embedding(query: str) -> Optional[List[float]]:
     return list(tup) if tup else None
 
 # ---------------------------------------------------------------------
-# Chat/LLM wrapper
+# --- Chat/LLM wrapper
 # ---------------------------------------------------------------------
 def _call_api_with_messages(messages_to_send: List[Dict[str, str]], max_tokens: int = 400) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+    """
+    Calls AOAI (chat completions) or public OpenAI chat completions and returns (full_resp, finish_reason, text)
+    Uses HTTP_TIMEOUT_LONG to give LLM more time.
+    """
     try:
+        # Azure AOAI chat completions
         if AOAI_ENDPOINT and AOAI_API_KEY and AOAI_CHAT_DEPLOYMENT:
             url = f"{AOAI_ENDPOINT}/openai/deployments/{AOAI_CHAT_DEPLOYMENT}/chat/completions?api-version={AOAI_API_VERSION}"
             headers = {"api-key": AOAI_API_KEY, "Content-Type": "application/json"}
@@ -241,6 +297,8 @@ def _call_api_with_messages(messages_to_send: List[Dict[str, str]], max_tokens: 
                 txt = resp.get("choices", [{}])[0].get("text")
             fr = resp["choices"][0].get("finish_reason") if resp.get("choices") else None
             return resp, fr, txt
+
+        # Public OpenAI chat completions fallback
         if OPENAI_API_KEY:
             url = "https://api.openai.com/v1/chat/completions"
             headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -256,32 +314,37 @@ def _call_api_with_messages(messages_to_send: List[Dict[str, str]], max_tokens: 
     return None, None, None
 
 # ---------------------------------------------------------------------
-# Truncation helpers (mantidos)
+# --- truncation detection and completion helpers ---
 # ---------------------------------------------------------------------
 def _looks_truncated(text: str) -> bool:
     if not text or not text.strip():
         return True
     t = text.rstrip()
+    # Ends with sentence punctuation -> likely complete
     if re.search(r'[\.!?]["\')\]]?\s*$', t):
         return False
     if t.endswith("..."):
         return True
+    # conservative: if last char not punctuation -> truncated
     return True
 
 def _complete_truncated(content: str, messages: List[Dict[str, str]], call_api_fn, max_retries: int = 2) -> str:
     if not _looks_truncated(content):
         return content
+
     for attempt in range(max_retries):
         finish_instruction = {
             "role": "user",
             "content": (
                 "A seguir está uma resposta parcial gerada. COMPLETE APENAS a continuação, "
-                "finalize a frase. Não repita o que já foi dito; escreva somente a continuação necessária em 1–2 frases."
+                "finalize a frase e encerre a resposta com exatamente: \"Quer mais detalhes? (s/n)\". "
+                "Não repita o que já foi dito; escreva somente a continuação necessária em 1–2 frases."
             )
         }
         follow_messages = copy.deepcopy(messages)
         follow_messages.append({"role": "assistant", "content": content})
         follow_messages.append(finish_instruction)
+
         resp, finish_reason, cont_text = call_api_fn(follow_messages, max_tokens=200)
         cont_text = (cont_text or "").strip()
         if cont_text:
@@ -297,71 +360,209 @@ def _complete_truncated(content: str, messages: List[Dict[str, str]], call_api_f
     return content
 
 # ---------------------------------------------------------------------
-# SUMARIZAÇÃO 100% EXTRATIVA
+# --- LLM summarizer enforcing PRINCIPAL prompt ---
 # ---------------------------------------------------------------------
-def _call_llm_summarize(question: str, quotes: List[Dict[str, str]], compact: bool = False) -> Optional[str]:
-    """
-    Gera uma resposta EXTRATIVA a partir dos trechos encontrados.
-    Se não houver evidência suficiente nos trechos, o modelo deve responder apenas: NAO_ENCONTRADO
-    """
+def _call_llm_summarize(question: str, quotes: List[Dict[str, str]]) -> Optional[str]:
+    import re
     if not quotes:
         return None
 
-    # Monta bloco de trechos a partir dos quotes reais
-    trechos_list = []
-    for i, q in enumerate(quotes, 1):
-        txt = (q.get("text") or q.get("content") or "").strip()
-        if not txt:
-            continue
-        if len(txt) > 1200:
-            txt = txt[:1200].rstrip() + "..."
-        src = q.get("source") or q.get("source_file") or q.get("doc_title") or ""
-        trechos_list.append(f"[{i}] {txt}\nFonte: {os.path.basename(src)}")
+    # Heurística simples para detectar perguntas do tipo "Sim/Não" em português.
+    def _is_yes_no_question(q: str) -> bool:
+        """
+        Heurística mais robusta pra detectar perguntas fechadas (Sim/Não).
+        - Descarta perguntas que começam com palavras interrogativas (quais, qual, como, quando, onde, o que, quem).
+        - Considera yes/no quando a pergunta começa com um modal/auxiliar (pode, deve, existe, há, tem) OU
+          quando há um padrão "sujeito + modal" no início (ex.: 'A escola pode...', 'O PDDE permite...').
+        - Usa word boundaries para evitar matches por substring.
+        """
+        
+        if not q or not isinstance(q, str):
+            return False
+        qq = q.strip().lower()
 
-    if not trechos_list:
+        # 1) Perguntas WH (quais/qual/como/onde/quando/o que/quem) => normalmente NÃO são yes/no
+        wh_prefixes = (
+            "quais ", "qual ", "como ", "quando ", "onde ", "o que", "que ", "quem ", "por que", "por quê"
+        )
+        for p in wh_prefixes:
+            if qq.startswith(p):
+                return False
+
+        # 2) Palavras-chave/auxiliares que sugerem yes/no (usar \b para word boundary)
+        yesno_words = r"\b(pode|podem|posso|permite|permitem|deve|devem|exige|exigem|existe|há|tem|precisa|necessita|é permitido|é proibido)\b"
+        # If starts with modal (e.g., "pode", "deve", "existe")
+        if re.match(rf'^{yesno_words}', qq):
+            return True
+
+        # 3) Subject + modal pattern near the start (e.g., "a escola pode", "o pdde permite")
+        if re.match(r'^(o|a|os|as|a escola|o pdde|pdde|a unidade)\b.*' + yesno_words, qq):
+            return True
+
+        # 4) fallback: if contains modal but question-mark and modal occurs very early (first 6 words)
+        if "?" in qq:
+            words = re.split(r'\s+', qq)
+            first_n = " ".join(words[:6])
+            if re.search(yesno_words, first_n):
+                return True
+
+        return False
+
+
+    is_yes_no = _is_yes_no_question(question)
+    logger.debug("Question detected as yes/no: %s | question: %s", is_yes_no, question)
+
+    prepared = []
+    for i, q in enumerate(quotes, start=1):
+        src = q.get("source") or q.get("source_file") or ""
+        txt = _clean_text(q.get("text") or q.get("content") or "")
+        if len(txt) > 1200:
+            txt = txt[:1200].rstrip() + " [trecho cortado]"
+        prepared.append({"i": i, "source": src, "text": txt})
+
+    # System message: regras gerais (reforçando a instrução de NÃO repetir "Quer mais detalhes?" mais de 1 vez)
+    system_msg = (
+        "Você é um assistente técnico e analítico que SINTETIZA respostas com base EXCLUSIVA nos trechos fornecidos. "
+        "Regra principal: Responda EM PORTUGUÊS em UM PARÁGRAFO (1–3 frases), direto e objetivo. "
+        "Não use listas, tópicos nem exemplos longos. Mantenha a resposta entre aproximadamente 30–70 palavras; explique o suficiente sem se estender demais. "
+        "Se for útil, inclua no máximo um comando ou trecho de código inline (máx. 1 linha). "
+        "Se a informação estiver incompleta para uma resposta completa, termine a resposta com exatamente: \"Quer mais detalhes? (s/n)\" — APENAS UMA VEZ, no final do parágrafo, sem repetir. "
+        "NÃO acrescente conhecimento externo que não esteja logicamente suportado pelos trechos abaixo. Quando mencionar algo que veio de um trecho, cite-o como [fonte #n] imediatamente após a afirmação."
+    )
+
+    # Instruição adicional condicionada: só comece com 'Sim.'/'Não.' quando a pergunta for do tipo fechada
+    if is_yes_no:
+        yesno_instr = (
+            "Observação: Esta pergunta parece ser do tipo fechada (resposta Sim/Não). "
+            "Se os trechos suportarem claramente 'Sim' ou 'Não', INICIE a resposta com 'Sim.' ou 'Não.' seguido por uma explicação curta (máx. 2 frases). "
+            "Caso os trechos não permitam uma conclusão clara, forneça uma resposta concisa sem forçar 'Sim.'/'Não' e inclua 'Quer mais detalhes? (s/n)' APENAS UMA VEZ ao final."
+        )
+    else:
+        yesno_instr = (
+            "Observação: Esta pergunta NÃO é do tipo fechada (Sim/Não). "
+            "NÃO inicie a resposta com 'Sim.' ou 'Não.' — comece diretamente com a síntese objetiva em 1 parágrafo (1–3 frases). "
+            "Se faltar informação, termine com 'Quer mais detalhes? (s/n)' APENAS UMA VEZ ao final."
+        )
+
+    user_msg_intro = f"Pergunta do usuário: {question}\n\nTrechos (use apenas o que há abaixo):\n"
+    for p in prepared:
+        user_msg_intro += f"\n[{p['i']}] Fonte: {p['source'] or 'desconhecida'}\n{p['text']}\n"
+
+    user_msg_instructions = (
+        "\nTarefas:\n"
+        "1) Responda à pergunta usando SOMENTE os trechos acima e inferências lógicas estritamente suportadas por eles.\n"
+        "2) Se mencionar algo que veio de um trecho, referencie-o com [fonte #n] logo após a afirmação.\n"
+        "3) Produza a resposta NO FORMATO exigido: 1 parágrafo (1–3 frases), entre 30–70 palavras, sem listas.\n"
+        "4) Inclua somente um comando/trecho de código inline se realmente útil (máx. 1 linha).\n"
+        "5) Se usar 'Quer mais detalhes? (s/n)', inclua-o EXATAMENTE UMA VEZ ao final do parágrafo.\n"
+    )
+
+    full_user_msg = user_msg_intro + "\n" + user_msg_instructions + "\n" + yesno_instr
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": full_user_msg}
+    ]
+
+    # Chamada principal
+    resp, finish_reason, content = _call_api_with_messages(messages, max_tokens=800)
+    content = (content or "").strip()
+    if not content:
         return None
 
-    trechos_block = "\n\n".join(trechos_list)
+    # Se veio truncado, pedir explicitamente apenas o complemento (sem repetir)
+    try:
+        if finish_reason == "length" or _looks_truncated(content):
+            logger.debug("Resposta truncada; solicitando complemento sem repetir conteúdo anterior.")
+            # instrução de complemento que pede para NÃO repetir texto já fornecido
+            followup = (
+                "A resposta anterior foi truncada. Por favor, COMPLETE APENAS o texto que falta para finalizar o parágrafo, "
+                "não repita frases já enviadas, não duplique 'Quer mais detalhes? (s/n)' e mantenha o formato de 1 parágrafo (1–3 frases)."
+            )
+            # append user followup instructing to complete
+            messages.append({"role": "user", "content": followup})
+            resp2, finish_reason2, content2 = _call_api_with_messages(messages, max_tokens=400)
+            content2 = (content2 or "").strip()
+            if content2:
+                # concatena com cautela: evita duplicar a parte final do content
+                # prefer usar somente content2 if content ends with ellipsis or incomplete sentence
+                if content.endswith("...") or content.endswith("…"):
+                    content = content.rstrip(".… ") + " " + content2
+                else:
+                    # se a segunda resposta parece ser apenas complemento, junte com espaço
+                    content = content + " " + content2
+    except Exception as e:
+        logger.exception("Error completing truncated LLM text: %s", e)
 
-    system = (
-        "Você é um assistente ESTRITAMENTE EXTRATIVO.\n"
-        "Siga TODAS as instruções abaixo com muito rigor:\n\n"
-        "1) Use SOMENTE as informações contidas nos trechos fornecidos.\n"
-        "2) É PROIBIDO usar conhecimento externo, completar lacunas, inferir fatos ou generalizar.\n"
-        "3) Se os trechos não trouxerem informação suficiente para responder à pergunta,\n"
-        "   responda APENAS o texto exato: NAO_ENCONTRADO.\n"
-        "4) Não repita a pergunta, não peça desculpas e não invente dados.\n"
-        "5) Responda em português claro e objetivo.\n"
-    )
+    # --- Pós-processamento / normalização para evitar duplicação e múltiplos 'Quer mais detalhes?' ---
+    def _normalize_answer(text: str) -> str:
+        if not text:
+            return text
+        t = text.strip()
 
-    user = (
-        f"Pergunta do usuário:\n"
-        f"{question}\n\n"
-        f"Trechos relevantes dos documentos (use APENAS essas informações para responder):\n"
-        f"{trechos_block}\n\n"
-        "Instruções para a resposta:\n"
-        "- Se os trechos trazem a informação necessária, escreva uma resposta direta e concisa,\n"
-        "  em 1 ou 2 parágrafos curtos, explicando o que a pergunta pede.\n"
-        "- Não acrescente nada que não esteja claramente suportado pelos trechos.\n"
-        "- Se realmente não houver informação suficiente para responder, responda apenas:\n"
-        "  NAO_ENCONTRADO\n"
-    )
+        # 1) normaliza espaços
+        t = re.sub(r'\s+', ' ', t)
 
-    _, _, ans = _call_api_with_messages(
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
-        ],
-        max_tokens=220 if compact else 400
-    )
+        # 2) substitui reticências múltiplas por ponto
+        t = re.sub(r'\.{2,}', '.', t)
 
-    if ans:
-        ans = ans.strip()
-    return ans or None
+        # 3) remove reticências isoladas antes de 'Quer mais detalhes', e normaliza
+        t = re.sub(r'\s*\.{1,}\s*(Quer mais detalhes\?)', r' \1', t, flags=re.I)
+
+        # 4) colapsa múltiplas ocorrências idênticas de "Quer mais detalhes? (s/n)"
+        t = re.sub(r'(Quer mais detalhes\? \(s\/n\))(?:\s*\1)+', r'\1', t, flags=re.I)
+
+        # 5) se houver >1 ocorrência em posições diferentes, remove todas e acrescenta só uma no final
+        qm_matches = re.findall(r'Quer mais detalhes\? \(s\/n\)', t, flags=re.I)
+        if len(qm_matches) > 1:
+            t = re.sub(r'Quer mais detalhes\? \(s\/n\)', '', t, flags=re.I).strip()
+            t = t.rstrip('.')
+            t = t + '. Quer mais detalhes? (s/n)'
+
+        # 6) separa em sentenças e remove sentenças adjacentes duplicadas (protege contra echo)
+        parts = re.split(r'(?<=[\.\?\!])\s+', t)
+        new_parts = []
+        prev = None
+        for p in parts:
+            p_norm = p.strip()
+            if not p_norm:
+                continue
+            if prev and p_norm == prev:
+                continue
+            # evita repetições muito semelhantes no início
+            if prev and p_norm.startswith(prev[:40]):
+                continue
+            new_parts.append(p_norm)
+            prev = p_norm
+        t = ' '.join(new_parts)
+
+        # 7) garantir que haja no máximo uma ocorrência final de 'Quer mais detalhes? (s/n)'
+        if re.search(r'Quer mais detalhes\? \(s\/n\)', t, flags=re.I):
+            # mover para o final (apenas uma vez)
+            t = re.sub(r'Quer mais detalhes\? \(s\/n\)', '', t, flags=re.I).strip()
+            if not t.endswith('.'):
+                t = t.rstrip('.')
+            t = t + '. Quer mais detalhes? (s/n)'
+
+        # 8) remover reticências residuais no fim
+        t = re.sub(r'(\.{2,})$', '.', t)
+
+        # 9) limpar espaços finais
+        t = re.sub(r'\s+', ' ', t).strip()
+
+        return t
+
+    try:
+        content = _normalize_answer(content)
+    except Exception as e:
+        logger.exception("Erro no pós-processamento da resposta: %s", e)
+
+    # limpeza final (usa sua função existente)
+    return _clean_text(content)
 
 
 # ---------------------------------------------------------------------
-# Resumos auxiliares (mantidos)
+# --- mini summary fallback (local heuristics) ---
 # ---------------------------------------------------------------------
 def _mini_summary_from_quotes(query: str, quotes: List[Dict[str, str]]) -> Optional[str]:
     if not quotes:
@@ -387,18 +588,24 @@ def _build_bullets_from_quotes(quotes: List[Dict[str, str]], max_bullets: int = 
     return bullets
 
 # ---------------------------------------------------------------------
-# Azure Cognitive Search
+# --- Azure Cognitive Search helpers (vector + text)
 # ---------------------------------------------------------------------
 def _vector_search(query: str, topk: int) -> List[Dict[str, Any]]:
+    """
+    Vector search: try cached embedding first; if missing, compute embedding here (short timeout).
+    If embedding cannot be obtained quickly, return [] (fallback to text-only).
+    """
     try:
         tup = _cached_query_embedding_tuple(query)
         vec = list(tup) if tup else None
     except Exception:
         vec = None
+
     if not vec:
         vec = _embedding_or_none(query)
         if not vec:
             return []
+
     url = f"{COG_SEARCH_ENDPOINT}/indexes/{COG_SEARCH_INDEX}/docs/search?api-version={COG_SEARCH_API_VERSION}"
     headers = {"api-key": COG_SEARCH_KEY, "Content-Type": "application/json"}
     payload = {
@@ -439,7 +646,11 @@ def _text_search(query: str, topk: int, force_semantic: bool = False, return_raw
         return [] if not return_raw else {}
     url = f"{COG_SEARCH_ENDPOINT}/indexes/{COG_SEARCH_INDEX}/docs/search?api-version={COG_SEARCH_API_VERSION}"
     headers = {"api-key": COG_SEARCH_KEY, "Content-Type": "application/json"}
-    base_payload: Dict[str, Any] = {"search": query, "top": topk, "searchFields": SEARCH_FIELDS}
+    base_payload: Dict[str, Any] = {
+        "search": query,
+        "top": topk,
+        "searchFields": SEARCH_FIELDS
+    }
 
     semantic_on = ENABLE_SEMANTIC and (force_semantic or bool(COG_SEARCH_SEM_CONFIG))
     if semantic_on:
@@ -459,6 +670,7 @@ def _text_search(query: str, topk: int, force_semantic: bool = False, return_raw
     try:
         data = _http_post(url, headers, base_payload, timeout=HTTP_TIMEOUT_LONG)
     except Exception as e:
+        # retry with simple if semantic params rejected
         msg = str(e)
         if "queryLanguage" in msg or "not a valid parameter for the operation 'search'" in msg:
             logger.info("semantic params rejected by service; retrying without semantic params")
@@ -470,10 +682,11 @@ def _text_search(query: str, topk: int, force_semantic: bool = False, return_raw
             data = _http_post(url, headers, simple_payload, timeout=HTTP_TIMEOUT_LONG)
         else:
             raise
+
     return data if return_raw else (data.get("value", []) if data else [])
 
 # ---------------------------------------------------------------------
-# Normalização/extração (mantido)
+# --- normalization, scoring, extraction (kept original heuristics)
 # ---------------------------------------------------------------------
 def _normalize_hit(h: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -559,14 +772,12 @@ def _extract_quotes(hits: List[Dict[str, Any]], query: str, per_doc: int = 3, ma
         parts = exact_phrase.split()
         if len(parts) > 5:
             exact_phrase = " ".join(parts[:5])
-
     def _has_key_term(text: str) -> bool:
         toks = set(_tokenize_pt(text))
         return len(qset & toks) > 0
-
     quotes: List[Dict[str, str]] = []
     seen: set = set()
-
+    # try prefer definitions first
     for h in hits:
         txt = h.get("text") or ""
         maybe_def = _prefer_definition(query, txt)
@@ -577,7 +788,7 @@ def _extract_quotes(hits: List[Dict[str, Any]], query: str, per_doc: int = 3, ma
                 seen.add(snip)
                 if len(quotes) >= max_quotes:
                     return quotes
-
+    # exact phrase hits
     if exact_phrase:
         for h in hits:
             txt = h.get("text") or ""
@@ -591,7 +802,7 @@ def _extract_quotes(hits: List[Dict[str, Any]], query: str, per_doc: int = 3, ma
                     seen.add(snip)
                     if len(quotes) >= max_quotes:
                         return quotes
-
+    # score-based extraction
     for h in hits:
         src = h.get("source_file") or h.get("id_original") or ""
         is_gloss = bool(re.search(r'gloss[aá]rio', src, flags=re.I))
@@ -647,50 +858,6 @@ def _prioritize_sources(sources, limit=4):
 def _validate_grounding(quotes: List[Dict[str, str]]) -> bool:
     return len(quotes) > 0
 
-# -------- NOVA FUNÇÃO: acha sentenças “normativas” explícitas --------
-_NORMATIVE_KEYWORDS = [
-    "procedimento", "procedimentos", "norma", "normas", "política", "políticas",
-    "deve", "devem", "obrigatório", "obrigatória", "obrigatórios",
-    "responsável", "responsáveis", "responsabilidade",
-    "é necessário", "é proibido", "não é permitido", "requisitos", "diretriz", "diretrizes"
-]
-
-def _find_explicit_policy_statements(nhits: List[Dict[str, Any]], query: str, q_tokens: List[str]) -> List[Dict[str, str]]:
-    """
-    Procura sentenças que aparentem ser instruções/mandatos/regras e que
-    tenham interseção com tokens da própria query. Útil para perguntas de 'procedimento/norma'.
-    """
-    if not nhits:
-        return []
-    qset = {t.lower() for t in q_tokens if t and t.lower() not in STOPWORDS}
-    out: List[Dict[str, str]] = []
-    for h in nhits:
-        raw = h.get("text") or ""
-        if not raw:
-            continue
-        sents = _split_sentences(raw)
-        for s in sents:
-            ss = _clean_text(s)
-            low = ss.lower()
-            if any(k in low for k in _NORMATIVE_KEYWORDS):
-                toks = {t for t in _tokenize_pt(low) if t not in STOPWORDS}
-                if qset and (qset & toks):
-                    out.append({
-                        "source": h.get("source_file") or h.get("id_original") or h.get("id") or "",
-                        "text": ss
-                    })
-    # dedup e limitação leve
-    seen = set(); final=[]
-    for q in out:
-        t = q["text"]
-        if t not in seen:
-            seen.add(t)
-            final.append(q)
-        if len(final) >= 6:
-            break
-    return final
-# ---------------------------------------------------------------------
-
 def _build_bullets_from_quotes(quotes: List[Dict[str, str]], max_bullets: int = 3) -> List[str]:
     bullets: List[str] = []
     for q in quotes:
@@ -702,108 +869,196 @@ def _build_bullets_from_quotes(quotes: List[Dict[str, str]], max_bullets: int = 
             break
     return bullets
 
-# ---------------------------------------------------------------------
-# Guardrails helpers
-# ---------------------------------------------------------------------
-def _in_domain(query: str) -> bool:
-    # normaliza acentos e remove pontuação
-    q = _strip_accents((query or "").lower())
-    q = re.sub(r"[^a-z0-9\s]+", " ", q)
-    # aceita se houver qualquer keyword do domínio como substring inteira
-    for kw in DOMAIN_KEYWORDS:
-        # exige coincidência de palavra (evita falsos positivos em substrings longas)
-        if re.search(rf"\b{re.escape(kw)}\b", q):
-            return True
-    return False
+def _extract_core_term_from_query(query: str) -> Optional[str]:
+    if not query:
+        return None
+    s = query.strip().lower()
+    if s.endswith("?"):
+        s = s[:-1].strip()
+    m = re.match(r"^(o que\s+(é|e))\s+", s, flags=re.IGNORECASE)
+    if m:
+        s = s[m.end():].strip()
+    s = re.sub(r"^(uma|um|a|o)\s+", "", s, flags=re.IGNORECASE).strip()
+    s = s.strip(" :–-—\"'")
+    if 2 <= len(s) <= 60:
+        return s
+    return None
 
-"""
-def _filter_hits_by_relevance(nhits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out = []
-    for h in nhits:
-        sc = h.get("score") or 0.0
-        try:
-            sc = float(sc)
-        except Exception:
-            sc = 0.0
-        if sc >= RELEVANCE_THRESHOLD_HITS:
-            out.append(h)
-    return out
-"""
-def _filter_hits_by_relevance(nhits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+# ---------------------------------------------------------------------
+# --- mini summary + answer building (integrated with LLM) ---
+# ---------------------------------------------------------------------
+def _mini_summary_from_quotes(query: str, quotes: List[Dict[str, str]]) -> str:
+    if _is_short_def_query(query):
+        def_quote: Optional[str] = None
+        core_term = _extract_core_term_from_query(query)
+        core_term_lower = core_term.lower() if core_term else None
+
+        if core_term_lower:
+            for q in quotes:
+                raw_text = q.get("text") or ""
+                t_clean = _clean_text(raw_text)
+                t_low = t_clean.lower()
+                if (
+                    t_low.startswith(core_term_lower)
+                    or f"{core_term_lower} |" in t_low
+                    or f"{core_term_lower}:" in t_low
+                ):
+                    def_quote = t_clean
+                    break
+
+        if def_quote is None:
+            for q in quotes:
+                t = q.get("text") or ""
+                if re.search(r"(?i)\b(definiç(?:ão|ões)|o que é|:)", t) and len(t) > 40:
+                    def_quote = _clean_text(t)
+                    break
+
+        if def_quote:
+            core = def_quote
+            if core_term_lower:
+                m = re.search(rf"(?i){re.escape(core_term_lower)}\s*[\|:]\s*(.+)", def_quote)
+                if m:
+                    core = _clean_text(m.group(1))
+            if core == def_quote:
+                m = re.search(r":\s*(.+)", def_quote)
+                if m:
+                    core = _clean_text(m.group(1))
+            if len(core) > 240:
+                core = core[:220].rstrip() + "..."
+            return core
+
+    logging.debug("SYNTHESIS: sending %d quotes to LLM:", len(quotes))
+    for i, q in enumerate(quotes, start=1):
+        logging.debug("QUOTE %d [%s]: %.240s", i, q.get("source") or "unknown", (q.get("text") or "").replace("\n", " ")[:240])
+
+    llm_resp = _call_llm_summarize(query, quotes)
+    if llm_resp:
+        llm_resp = _clean_text(llm_resp)
+        if len(llm_resp) > 1000:
+            llm_resp = llm_resp[:980].rstrip() + "..."
+        return llm_resp
+
+    first = _clean_text(quotes[0]["text"]) if quotes else ""
+    part = first[:220].rstrip() + ("..." if len(first) > 220 else "")
+    return part
+
+def _answer_not_found() -> Dict[str, Any]:
+    return {
+        "text": "Não tenho essa informação",
+        "bullets": [],
+        "sources": [],
+        "quotes": [],
+        "issues": ["no_evidence"]
+    }
+
+def _find_explicit_policy_statements(nhits: List[Dict[str, Any]], query: str, keywords: Optional[List[str]] = None) -> List[Dict[str,str]]:
     if not nhits:
         return []
-    strong = []
+    if keywords is None:
+        tokens = re.findall(r"[A-Za-zÀ-ú0-9]+", (query or ""))
+        keywords = [t.lower() for t in tokens if len(t) > 1]
+    kws = set(keywords)
+    patterns = [
+        r"\b({kw})\b[\s\S]{0,120}?\b(sim|permitido|autorizad[ao]|pode ser usado|pode ser aplicad[ao]|autoriz[ae])\b",
+        r"\b(sim)\b[\s\S]{0,30}?\b({kw})\b",
+        r"\b({kw})\b[\s\S]{0,80}?\b(vedado|não pode|não deverão|não autorizado)\b",
+        r"\b({kw})\b[\s\S]{0,120}?\b(CONFIRM|SIM|NÃO|VEDADO)\b"
+    ]
+    found = []
     for h in nhits:
-        sc = h.get("score") or 0.0
+        raw = (h.get("text") or "")
+        if not raw or len(raw) < 30:
+            continue
+        norm = raw.lower()
+        for kw in list(kws):
+            kw_escaped = re.escape(kw)
+            for pat in patterns:
+                p = pat.replace("{kw}", kw_escaped)
+                try:
+                    m = re.search(p, norm, flags=re.I)
+                except re.error as re_err:
+                    logging.debug("invalid regex built for kw=%s pat=%s error=%s", kw, p, re_err)
+                    m = None
+                if m:
+                    start = max(0, m.start() - 80)
+                    end   = min(len(raw), m.end() + 80)
+                    ctx = _clean_text(raw[start:end])
+                    src = h.get("source_file") or h.get("id_original") or ""
+                    if ctx and not any(ctx == x["text"] for x in found):
+                        found.append({"source": src, "text": ctx})
+                    break
+            if found and found[-1]["source"] == (h.get("source_file") or ""):
+                break
+    return found
+
+def _answer_from_quotes(query: str, quotes: List[Dict[str, str]], sources: List[str]) -> Dict[str, Any]:
+    def _is_truncated_text(t: str) -> bool:
+        if not t or not t.strip():
+            return True
+        t = t.rstrip()
+        if re.search(r'[\.!\?]["\')\]]?\s*$', t):
+            return False
+        if t.endswith("..."):
+            return False
+        m = re.search(r'([^\s]+)$', t)
+        if m:
+            last = m.group(1)
+            if len(last) <= 3:
+                return True
+            if re.search(r'[^A-Za-zÀ-ú0-9\-]$', last):
+                return True
+            return True
+        return True
+
+    try:
+        summary = _mini_summary_from_quotes(query, quotes)
+    except Exception as e:
+        logging.exception("Erro em _mini_summary_from_quotes: %s", e)
+        summary = ""
+
+    logging.debug("SUMMARY initial tail: %.120s", (summary or "")[-120:])
+    tried_completion = False
+    if _is_truncated_text(summary):
+        logging.info("Resumo parece truncado -> tentando completar via LLM")
+        tried_completion = True
         try:
-            sc = float(sc)
-        except Exception:
-            sc = 0.0
-        if sc >= RELEVANCE_THRESHOLD_HITS:
-            strong.append(h)
+            llm_done = _call_llm_summarize(query, quotes)
+            if llm_done:
+                llm_done = _clean_text(llm_done)
+                logging.debug("LLM returned tail: %.120s", llm_done[-120:])
+                if llm_done and (not _is_truncated_text(llm_done)):
+                    summary = llm_done
+                else:
+                    if llm_done and len(llm_done) > len(summary):
+                        summary = llm_done
+        except Exception as e:
+            logging.exception("Error calling LLM to complete summary: %s", e)
 
-    # se nada passou no threshold, pega pelo menos os top 5
-    if strong:
-        return strong
-    nhits_sorted = sorted(nhits, key=lambda x: (x.get("score") or 0.0), reverse=True)
-    return nhits_sorted[:5]
+    if _is_truncated_text(summary):
+        logging.info("After attempts, summary still truncated. Applying fallback ellipsis.")
+        summary = summary.rstrip()
+        if not summary.endswith("..."):
+            summary = summary + "..."
+    else:
+        if "Quer mais detalhes? (s/n)" not in summary:
+            if not _validate_grounding(quotes):
+                summary = summary.rstrip()
+                if not summary.endswith((".", "?", "!")):
+                    summary = summary + "."
+                summary = summary + " Quer mais detalhes? (s/n)"
 
-
-
-
-# ---------------------------------------------------------------------
-# Respostas finais
-# ---------------------------------------------------------------------
-NOT_FOUND_MSG   = "Não encontrei informações sobre esse tema nos documentos indexados."
-OUT_OF_SCOPE_MSG= "Esse tema não faz parte do escopo dos documentos indexados (manuais/obras/segurança/manutencao)."
-
-def _answer_not_found(compact: bool) -> Dict[str, Any]:
-    txt = NOT_FOUND_MSG if compact else NOT_FOUND_MSG + " Tente reformular a pergunta com termos do domínio."
-    return {"text": txt, "sources": []}
-
-def _dedupe_sentences(text: str) -> str:
-    import re as _re
-    t = (text or "").strip()
-    if not t:
-        return t
-    t = _re.sub(r'\s+', ' ', t)
-    parts = _re.split(r'(?<=[\.\?!])\s+', t)
-    seen, clean = set(), []
-    for p in parts:
-        k = p.strip().lower()
-        if k and k not in seen:
-            seen.add(k)
-            clean.append(p.strip())
-    return " ".join(clean)
-
-def _render_sources(quotes: List[Dict[str, Any]], max_items: int = 4) -> List[str]:
-    out = []
-    for q in quotes[:max_items]:
-        src = q.get("source") or q.get("source_file") or ""
-        if src:
-            out.append(src)
-    return list(dict.fromkeys(out))
-
-def _answer_from_quotes(query: str, quotes: List[Dict[str, Any]], compact: bool) -> Dict[str, Any]:
-    # Se não há evidência e a query realmente parece fora do domínio, sinaliza fora do escopo
-    if not quotes and not _in_domain(query):
-        return {"text": OUT_OF_SCOPE_MSG, "sources": []}
-
-    # Se há poucas evidências e está muito fraco, ainda podemos responder se ALLOW_COMPLETION_WHEN_WEAK=true
-    if len(quotes) < MIN_QUOTES_REQUIRED and not ALLOW_COMPLETION_WHEN_WEAK:
-        return _answer_not_found(compact)
-
-    summary = _call_llm_summarize(query, quotes, compact=compact)
-    if not summary or summary.strip().upper() == "NAO_ENCONTRADO":
-        # Se não conseguiu montar resposta mesmo com evidências, cai para NOT FOUND (não alucina)
-        return _answer_not_found(compact)
-
-    summary = _dedupe_sentences(summary)
-    return {"text": summary, "sources": _render_sources(quotes)}
-
+    bullets = _build_bullets_from_quotes(quotes, max_bullets=3)
+    src_names = [_filename_from_source(s) for s in (sources or [])]
+    return {
+        "text": summary,
+        #"bullets": bullets,
+        "sources": src_names[:10],
+        #"quotes": quotes or [],
+        "meta": {"tried_completion": tried_completion, "quotes_count": len(quotes)}
+    }
 
 # ---------------------------------------------------------------------
-# Co-ocorrência, assembly e handler principal
+# --- co-occurrence, assembly and main handler
 # ---------------------------------------------------------------------
 def _derive_query_key_tokens(query: str, min_token_len: int = 2) -> List[str]:
     toks = re.findall(r"[A-Za-zÀ-ú0-9]+", query or "")
@@ -881,6 +1136,7 @@ def _add_query_doc_cooccurrence(nhits: List[Dict[str, Any]], quotes: List[Dict[s
                 seen_texts.add(ctx_clean)
                 if len(added) >= max_added_docs:
                     break
+        # fallback pairwise co-occurrence
         raw_norm = re.sub(r'\s+', ' ', _clean_text(raw)).lower()
         token_spans = {}
         for t in q_tokens:
@@ -899,7 +1155,7 @@ def _add_query_doc_cooccurrence(nhits: List[Dict[str, Any]], quotes: List[Dict[s
                 spans_list.append((t, sp[0], sp[1]))
         spans_list.sort(key=lambda x: x[1])
         found_pair_ctx = None
-        char_window_size = _safe_int_env("COOC_CHAR_WINDOW", 300)
+        char_window_size = _safe_int_env("COOC_CHAR_WINDOW", "300")
         for i in range(len(spans_list)):
             t1, s1, e1 = spans_list[i]
             for j in range(i+1, min(i+6, len(spans_list))):
@@ -939,21 +1195,87 @@ def _add_query_doc_cooccurrence(nhits: List[Dict[str, Any]], quotes: List[Dict[s
     return quotes
 
 # ---------------------------------------------------------------------
-# Handler principal
+# --- main handler: parallel vector+text with timeouts and fallbacks
 # ---------------------------------------------------------------------
 def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
-    import logging
+    # --- DEBUG INJECTION: cole onde seu handler começa ---
+    import os, json, logging
+    from datetime import datetime
+
+    logger = logging.getLogger("function_debug")
+    logger.setLevel(logging.DEBUG)
+
+    def _mask(s):
+        if not s: return "<empty>"
+        s = str(s)
+        if len(s) <= 8: return s
+        return s[:4] + "..." + s[-4:]
+
+    def debug_env_and_request(context_name: str, payload: dict):
+        # imprime quais VARS estão presentes e qual o código escolheu usar (prioridade)
+        env = os.environ
+        # candidate names your code may use
+        candidates = {
+            "SEARCH_ENDPOINT": env.get("SEARCH_ENDPOINT"),
+            "COG_SEARCH_ENDPOINT": env.get("COG_SEARCH_ENDPOINT"),
+            "SEARCH_API_KEY": env.get("SEARCH_API_KEY"),
+            "COG_SEARCH_KEY": env.get("COG_SEARCH_KEY"),
+            "SEARCH_INDEX": env.get("SEARCH_INDEX"),
+            "COG_SEARCH_INDEX": env.get("COG_SEARCH_INDEX"),
+            "ENABLE_SEMANTIC": env.get("ENABLE_SEMANTIC"),
+            "OPENAI_API_BASE": env.get("OPENAI_API_BASE"),
+            "OPENAI_API_KEY": env.get("OPENAI_API_KEY"),
+            "AOAI_ENDPOINT": env.get("AOAI_ENDPOINT"),
+            "AOAI_API_KEY": env.get("AOAI_API_KEY"),
+            "OPENAI_DEPLOYMENT": env.get("OPENAI_DEPLOYMENT"),
+            "AOAI_CHAT_DEPLOYMENT": env.get("AOAI_CHAT_DEPLOYMENT"),
+        }
+
+        logger.debug("=== DEBUG START [%s] %s ===", context_name, datetime.utcnow().isoformat())
+        # print chosen resolved settings (prioritize explicit ones your code uses)
+        # Example resolution logic (log both to compare)
+        resolved_search_endpoint = env.get("SEARCH_ENDPOINT") or env.get("COG_SEARCH_ENDPOINT")
+        resolved_search_key = env.get("SEARCH_API_KEY") or env.get("COG_SEARCH_KEY")
+        resolved_search_index = env.get("SEARCH_INDEX") or env.get("COG_SEARCH_INDEX")
+
+        logger.debug("resolved_search_endpoint=%s", _mask(resolved_search_endpoint))
+        logger.debug("resolved_search_key=%s", _mask(resolved_search_key))
+        logger.debug("resolved_search_index=%s", _mask(resolved_search_index))
+        logger.debug("ENABLE_SEMANTIC=%s", _mask(env.get("ENABLE_SEMANTIC")))
+        logger.debug("OPENAI_API_BASE=%s", _mask(env.get("OPENAI_API_BASE")))
+        logger.debug("OPENAI_DEPLOYMENT=%s", _mask(env.get("OPENAI_DEPLOYMENT")))
+        # show presence of candidates (masked)
+        for k,v in candidates.items():
+            logger.debug("env %s = %s", k, _mask(v))
+
+        # Log the incoming payload that your function will use to call Search/Embeddings/LLM
+        try:
+            # Mask any known secret-like keys inside payload
+            payload_copy = dict(payload) if isinstance(payload, dict) else {"body": str(payload)}
+            # if body contains 'code' or keys with secrets, mask
+            for secret_key in ("api_key","key","openai_key","aoai_key","search_key"):
+                if secret_key in payload_copy:
+                    payload_copy[secret_key] = _mask(payload_copy[secret_key])
+            logger.debug("incoming_payload: %s", json.dumps(payload_copy, ensure_ascii=False, default=str))
+        except Exception as e:
+            logger.exception("failed to log payload: %s", e)
+
+        # Example usage: call this at top of your request handler
+        # debug_env_and_request("handle_search_request", {"query": query, "topK": topK, "debug": debug_flag})
+        # --- DEBUG INJECTION END ---
+        # antes de executar qualquer coisa:
     if body.get("debug"):
         log_config(debug_flag=True)
 
-    query   = (body or {}).get("query") or ""
-    topk    = int((body or {}).get("topK") or DEFAULT_TOPK)
-    compact = bool((body or {}).get("compact", False))
+    query = (body or {}).get("query") or ""
+    topk  = int((body or {}).get("topK") or DEFAULT_TOPK)
+    debug = bool((body or {}).get("debug", False))
 
     if _is_short_def_query(query):
         topk = max(topk, 12)
 
     used_embedding = False
+    embedding_error = None
     hits: List[Dict[str, Any]] = []
     sem_json = None
 
@@ -989,10 +1311,12 @@ def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
                 seen.add(t)
         return out[:5]
 
+    # Run vector and text search in parallel. Vector search will compute embedding itself (and use LRU/persistent cache)
     with ThreadPoolExecutor(max_workers=2) as ex:
-        future_vec  = ex.submit(_vector_search, query, topk)
+        future_vec = ex.submit(_vector_search, query, topk)
         future_text = ex.submit(_text_search, query, topk, force_semantic=_is_short_def_query(query), return_raw=True)
 
+        # Prefer to wait a bit for text search (often faster)
         try:
             sem_json = future_text.result(timeout=HTTP_TIMEOUT_LONG + 5)
             thits = (sem_json.get("value", []) if isinstance(sem_json, dict) else [])
@@ -1007,6 +1331,7 @@ def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
             logging.warning("vector search failed or timed out: %s", e)
             vhits = []
 
+        # merge by id without duplicates
         if vhits:
             hits.extend(vhits)
             used_embedding = True
@@ -1020,14 +1345,8 @@ def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
                     by_id[f"__noid__{id(h)}"] = h
             hits = list(by_id.values())
 
-    nhits_all = [_normalize_hit(h) for h in hits]
-    nhits = _filter_hits_by_relevance(nhits_all)
-
+    nhits = [_normalize_hit(h) for h in hits]
     sources = _prioritize_sources([h.get("source_file") or h.get("id_original") for h in nhits if h])
-
-    def _find_explicit_policy_statements_wrapper():
-        q_tokens_for_search = [t for t in re.findall(r"[A-Za-zÀ-ú0-9]+", query) if len(t) > 1]
-        return _find_explicit_policy_statements(nhits, query, q_tokens_for_search)
 
     semantic_quotes = _harvest_semantic_evidence_local(sem_json) if isinstance(sem_json, dict) else []
     quotes_main = _extract_quotes(nhits, query, per_doc=3, max_quotes=8)
@@ -1041,7 +1360,8 @@ def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
             seen_q.add(snip)
     quotes = quotes[:8]
 
-    explicit_quotes = _find_explicit_policy_statements_wrapper()
+    q_tokens_for_search = [t for t in re.findall(r"[A-Za-zÀ-ú0-9]+", query) if len(t) > 1]
+    explicit_quotes = _find_explicit_policy_statements(nhits, query, q_tokens_for_search)
     if explicit_quotes:
         existing = { _clean_text(q.get("text") or "") for q in quotes }
         new_explicit = [q for q in explicit_quotes if _clean_text(q.get("text") or "") not in existing]
@@ -1065,8 +1385,7 @@ def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
         try:
             sem_json2 = _text_search(query, max(topk, 15), force_semantic=True, return_raw=True)
             thits2 = (sem_json2.get("value", []) if isinstance(sem_json2, dict) else [])
-            nhits2_all = [_normalize_hit(h) for h in thits2] if thits2 else []
-            nhits2 = _filter_hits_by_relevance(nhits2_all)
+            nhits2 = [_normalize_hit(h) for h in thits2] if thits2 else []
             semantic_quotes2 = _harvest_semantic_evidence_local(sem_json2) if isinstance(sem_json2, dict) else []
             quotes2_main = _extract_quotes(nhits2, query, per_doc=3, max_quotes=8)
             seen2 = set()
@@ -1082,17 +1401,16 @@ def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
         except Exception as e:
             logging.warning("second text search failed: %s", e)
 
-    result = _answer_not_found(compact) if not quotes else _answer_from_quotes(query, quotes, compact)
+    result = _answer_not_found() if not quotes else _answer_from_quotes(query, quotes, sources)
 
     return {
         "status": "ok",
-        "versao":"v1.01",
         "query": query,
         "result": result
     }
 
 # ---------------------------------------------------------------------
-# Utilidade: detectar perguntas curtas de definição
+# --- utility: short query detection
 # ---------------------------------------------------------------------
 def _is_short_def_query(query: str) -> bool:
     q = _clean_text(query).lower()
@@ -1105,10 +1423,10 @@ def _is_short_def_query(query: str) -> bool:
     return False
 
 # ---------------------------------------------------------------------
-# Execução local
+# --- if used as script locally for quick test
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    test_query = "O que é gestão de projetos segundo o PMBOK?"
-    body = {"query": test_query, "topK": 10, "compact": True, "debug": True}
+    test_query = _safe_int_env("TEST_QUERY", "O que é uma Demanda nova?")
+    body = {"query": test_query, "topK": 6, "debug": True}
     out = handle_search_request(body)
     print(json.dumps(out, ensure_ascii=False, indent=2))
