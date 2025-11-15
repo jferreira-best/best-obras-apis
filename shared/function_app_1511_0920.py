@@ -117,8 +117,7 @@ HTTP_TIMEOUT_LONG      = _safe_int_env("HTTP_TIMEOUT_LONG", 20)
 EMB_CACHE_FILE         = _safe_str_env("EMB_CACHE_FILE", "/tmp/emb_cache.db")
 
 # ---------- GUARDRAILS NOVOS (menos restritivos) ----------
-#RELEVANCE_THRESHOLD_HITS = float(os.getenv("RELEVANCE_THRESHOLD_HITS", "0.18"))  # era 0.28
-RELEVANCE_THRESHOLD_HITS = float(os.getenv("RELEVANCE_THRESHOLD_HITS", "0.10"))
+RELEVANCE_THRESHOLD_HITS = float(os.getenv("RELEVANCE_THRESHOLD_HITS", "0.18"))  # era 0.28
 MIN_QUOTES_REQUIRED      = int(os.getenv("MIN_QUOTES_REQUIRED", "2"))            # era 3
 ALLOW_COMPLETION_WHEN_WEAK = os.getenv("ALLOW_COMPLETION_WHEN_WEAK", "true").lower() in ("1","true","yes","on")
 
@@ -177,8 +176,7 @@ def _embedding_or_none(text: str) -> Optional[List[float]]:
         return None
     try:
         if AOAI_ENDPOINT and AOAI_API_KEY and AOAI_EMB_DEPLOYMENT:
-            #url = f"{AOAI_ENDPOINT}/openai/deployments/{AOAI_EMB_DEPLOYMENT}/embeddings?api-version=2023-05-15"
-            url = f"{AOAI_ENDPOINT}/openai/deployments/{AOAI_EMB_DEPLOYMENT}/embeddings?api-version={AOAI_API_VERSION}"
+            url = f"{AOAI_ENDPOINT}/openai/deployments/{AOAI_EMB_DEPLOYMENT}/embeddings?api-version=2023-05-15"
             headers = {"api-key": AOAI_API_KEY, "Content-Type": "application/json"}
             payload = {"input": text}
             r = requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT_SHORT)
@@ -195,8 +193,7 @@ def _embedding_or_none(text: str) -> Optional[List[float]]:
         if OPENAI_API_KEY:
             url = "https://api.openai.com/v1/embeddings"
             headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-            #payload = {"model": "text-embedding-3-small", "input": text}
-            payload = {"model": "text-embedding-3-large", "input": text}
+            payload = {"model": "text-embedding-3-small", "input": text}
             r = requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT_SHORT)
             r.raise_for_status()
             data = r.json()
@@ -327,12 +324,14 @@ def _call_llm_summarize(question: str, quotes: List[Dict[str, str]], compact: bo
     trechos_block = "\n\n".join(trechos_list)
 
     system = (
-        "Você é um assistente de IA focado em responder perguntas usando documentos de referência.\n"
+        "Você é um assistente ESTRITAMENTE EXTRATIVO.\n"
         "Siga TODAS as instruções abaixo com muito rigor:\n\n"
-        "1) Baseie sua resposta **prioritariamente** nas informações dos trechos fornecidos.\n"
-        "2) É PROIBIDO usar conhecimento externo, completar lacunas ou inferir fatos que não estejam nos trechos.\n"
-        "3) Tente responder a pergunta da melhor forma possível usando os trechos. Se os trechos forem irrelevantes ou realmente não contiverem a resposta, explique que não encontrou a informação específica nos documentos.\n"
-        "4) Não repita a pergunta, não peça desculpas.\n"
+        "1) Use SOMENTE as informações contidas nos trechos fornecidos.\n"
+        "2) É PROIBIDO usar conhecimento externo, completar lacunas, inferir fatos ou generalizar.\n"
+        #"3) Se os trechos não trouxerem informação suficiente para responder à pergunta,\n"
+        #"   responda APENAS o texto exato: NAO_ENCONTRADO.\n"
+        "3) Tente responder a pergunta da melhor forma possível usando os trechos. Se os trechos não ajudarem, explique que não encontrou a informação específica.\n"
+        "4) Não repita a pergunta, não peça desculpas e não invente dados.\n"
         "5) Responda em português claro e objetivo.\n"
     )
 
@@ -451,7 +450,7 @@ def _text_search(query: str, topk: int, semantic_config: str,search_index: str, 
     if semantic_on:
         base_payload.update({
             "queryType": "semantic",
-            #"queryLanguage": "pt-BR",
+            "queryLanguage": "pt-BR",
             "answers": "extractive",
             "answersCount": 1,
             "captions": "extractive",
@@ -484,9 +483,7 @@ def _text_search(query: str, topk: int, semantic_config: str,search_index: str, 
 def _normalize_hit(h: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": h.get("id"),
-        #"score": h.get("@search.score"),
-        #"score": (h.get("@search.rerankerScore") / 4.0) if h.get("@search.rerankerScore") else h.get("@search.score"),
-        "score": (h.get("@search.rerankerScore") / 4.0) if h.get("@search.rerankerScore") else (h.get("@search.vectorSearchScore") or h.get("@search.score")),
+        "score": h.get("@search.score"),
         "text": _clean_text(h.get("text") or ""),
         "source_file": h.get("source_file"),
         "id_original": h.get("id_original"),
@@ -958,12 +955,6 @@ def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
     topk    = int((body or {}).get("topK") or DEFAULT_TOPK)
     compact = bool((body or {}).get("compact", False))
 
-    # --- NOVO AJUSTE DE REGRA DE NEGÓCIO (Forçar Emergência) ---
-    query_lower = query.lower()
-    if ("preso" in query_lower or "trancado" or "quebrou" in query_lower) and "elevador" in query_lower:
-        logging.info("Regra de negócio: Forçando 'emergência' para consulta de elevador preso.")
-        query = query + " emergência risco"
-    
     # NOVAS LINHAS: Pega os valores do body (com um fallback seguro)
     # Note que não usamos mais COG_SEARCH_INDEX ou COG_SEARCH_SEM_CONFIG global
     req_index    = (body or {}).get("search_index") or COG_SEARCH_INDEX
@@ -1109,7 +1100,7 @@ def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "status": "ok",
-        "versao":"v1.02",
+        "versao":"v1.01",
         "query": query,
         "result": result
     }
