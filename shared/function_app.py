@@ -330,12 +330,14 @@ def _call_llm_summarize(question: str, quotes: List[Dict[str, str]], compact: bo
         "Você é um assistente de IA focado em responder perguntas usando documentos de referência.\n"
         "Siga TODAS as instruções abaixo com muito rigor:\n\n"
         "1) Baseie sua resposta **prioritariamente** nas informações dos trechos fornecidos.\n"
-        "2) É PROIBIDO usar conhecimento externo, completar lacunas ou inferir fatos que não estejam nos trechos.\n"
-        "3) Tente responder a pergunta da melhor forma possível usando os trechos. Se os trechos forem irrelevantes ou realmente não contiverem a resposta, explique que não encontrou a informação específica nos documentos.\n"
-        "4) Não repita a pergunta, não peça desculpas.\n"
-        "5) Responda em português claro e objetivo.\n"
+        "2) É PROIBIDO usar conhecimento externo ou inferir fatos que não estejam nos trechos.\n"
+        "3) **REGRA DE NEGÓCIO (RISCO vs EMERGÊNCIA):** Se a pergunta for sobre um *risco* (ex: 'trinca', 'pode cair', 'parece que vai cair'), use a definição de 'Manutenção de Risco'. Se a pergunta for sobre um *evento que já ocorreu* (ex: 'caiu', 'desabou'), use a definição de 'Emergência' ou 'Queda de Muro'.\n"
+        "4) Tente responder a pergunta da melhor forma possível usando os trechos. Se os trechos forem irrelevantes ou realmente não contiverem a resposta, explique que não encontrou a informação específica nos documentos.\n"
+        "5) Não repita a pergunta, não peça desculpas.\n"
+        "6) Responda em português claro e objetivo.\n"
     )
 
+    # --- CORREÇÃO 2: Removida a regra contraditória "NAO_ENCONTRADO" ---
     user = (
         f"Pergunta do usuário:\n"
         f"{question}\n\n"
@@ -345,8 +347,6 @@ def _call_llm_summarize(question: str, quotes: List[Dict[str, str]], compact: bo
         "- Se os trechos trazem a informação necessária, escreva uma resposta direta e concisa,\n"
         "  em 1 ou 2 parágrafos curtos, explicando o que a pergunta pede.\n"
         "- Não acrescente nada que não esteja claramente suportado pelos trechos.\n"
-        "- Se realmente não houver informação suficiente para responder, responda apenas:\n"
-        "  NAO_ENCONTRADO\n"
     )
 
     _, _, ans = _call_api_with_messages(
@@ -1109,7 +1109,7 @@ def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "status": "ok",
-        "versao":"v1.04",
+        "versao":"v1.05",
         "query": query,
         "result": result
     }
