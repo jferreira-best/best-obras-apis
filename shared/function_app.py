@@ -329,12 +329,13 @@ def _call_llm_summarize(question: str, quotes: List[Dict[str, str]], compact: bo
     system = (
         "Você é um assistente de IA focado em responder perguntas usando documentos de referência.\n"
         "Siga TODAS as instruções abaixo com muito rigor:\n\n"
-        "1) Baseie sua resposta **prioritariamente** nas informações dos trechos fornecidos.\n"
-        "2) É PROIBIDO usar conhecimento externo ou inferir fatos que não estejam nos trechos.\n"
-        "3) **REGRA DE NEGÓCIO (RISCO vs EMERGÊNCIA):** Se a pergunta for sobre um *risco* (ex: 'trinca', 'pode cair', 'parece que vai cair'), use a definição de 'Manutenção de Risco'. Se a pergunta for sobre um *evento que já ocorreu* (ex: 'caiu', 'desabou'), use a definição de 'Emergência' ou 'Queda de Muro'.\n"
-        "4) Tente responder a pergunta da melhor forma possível usando os trechos. Se os trechos forem irrelevantes ou realmente não contiverem a resposta, explique que não encontrou a informação específica nos documentos.\n"
-        "5) Não repita a pergunta, não peça desculpas.\n"
-        "6) Responda em português claro e objetivo.\n"
+        "1) Baseie sua resposta **EXCLUSIVAMENTE** nas informações dos trechos fornecidos.\n"
+        "2) É PROIBIDO **inventar** fatos ou usar conhecimento externo que não esteja nos trechos.\n"
+        "3) **PERMITIDO FAZER CONEXÕES:** Você **DEVE** conectar o sentido da pergunta com o sentido dos trechos. Por exemplo, se a pergunta é 'quem autoriza' e o texto diz 'cabe ao CEPLAE deliberar', você deve entender que 'deliberar' é a resposta para 'autorizar'. O mesmo vale para 'fluxo de solicitação' e 'manifestação'.\n"
+        "4) **REGRA DE NEGÓCIO (RISCO vs EMERGÊNCIA):** Se a pergunta for sobre um *risco* (ex: 'trinca', 'pode cair', 'parece que vai cair'), use a definição de 'Manutenção de Risco'. Se a pergunta for sobre um *evento que já ocorreu* (ex: 'caiu', 'desabou'), use a definição de 'Emergência' ou 'Queda de Muro'.\n"
+        "5) Tente responder a pergunta da melhor forma possível usando os trechos. Se os trechos forem irrelevantes ou realmente não contiverem a resposta (mesmo após tentar fazer as conexões de sentido da regra #3), explique que não encontrou a informação específica nos documentos.\n"
+        "6) Não repita a pergunta, não peça desculpas.\n"
+        "7) Responda em português claro e objetivo.\n"
     )
 
     # --- CORREÇÃO 2: Removida a regra contraditória "NAO_ENCONTRADO" ---
@@ -1109,7 +1110,7 @@ def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "status": "ok",
-        "versao":"v1.05",
+        "versao":"v1.06",
         "query": query,
         "result": result
     }
