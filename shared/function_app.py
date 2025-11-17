@@ -1109,7 +1109,7 @@ def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "status": "ok",
-        "versao":"v1.02",
+        "versao":"v1.03",
         "query": query,
         "result": result
     }
