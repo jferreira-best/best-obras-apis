@@ -14,6 +14,12 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, unquote
 import requests
+import azure.functions as func
+
+# Inicializa o App do Azure Functions
+app = func.FunctionApp()
+
+
 
 # =========================
 # LOG
@@ -117,7 +123,8 @@ HTTP_TIMEOUT_LONG      = _safe_int_env("HTTP_TIMEOUT_LONG", 20)
 EMB_CACHE_FILE         = _safe_str_env("EMB_CACHE_FILE", "/tmp/emb_cache.db")
 
 # ---------- GUARDRAILS NOVOS (menos restritivos) ----------
-RELEVANCE_THRESHOLD_HITS = float(os.getenv("RELEVANCE_THRESHOLD_HITS", "0.18"))  # era 0.28
+#RELEVANCE_THRESHOLD_HITS = float(os.getenv("RELEVANCE_THRESHOLD_HITS", "0.18"))  # era 0.28
+RELEVANCE_THRESHOLD_HITS = float(os.getenv("RELEVANCE_THRESHOLD_HITS", "0.10"))
 MIN_QUOTES_REQUIRED      = int(os.getenv("MIN_QUOTES_REQUIRED", "2"))            # era 3
 ALLOW_COMPLETION_WHEN_WEAK = os.getenv("ALLOW_COMPLETION_WHEN_WEAK", "true").lower() in ("1","true","yes","on")
 
@@ -176,7 +183,8 @@ def _embedding_or_none(text: str) -> Optional[List[float]]:
         return None
     try:
         if AOAI_ENDPOINT and AOAI_API_KEY and AOAI_EMB_DEPLOYMENT:
-            url = f"{AOAI_ENDPOINT}/openai/deployments/{AOAI_EMB_DEPLOYMENT}/embeddings?api-version=2023-05-15"
+            #url = f"{AOAI_ENDPOINT}/openai/deployments/{AOAI_EMB_DEPLOYMENT}/embeddings?api-version=2023-05-15"
+            url = f"{AOAI_ENDPOINT}/openai/deployments/{AOAI_EMB_DEPLOYMENT}/embeddings?api-version={AOAI_API_VERSION}"
             headers = {"api-key": AOAI_API_KEY, "Content-Type": "application/json"}
             payload = {"input": text}
             r = requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT_SHORT)
@@ -193,7 +201,8 @@ def _embedding_or_none(text: str) -> Optional[List[float]]:
         if OPENAI_API_KEY:
             url = "https://api.openai.com/v1/embeddings"
             headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-            payload = {"model": "text-embedding-3-small", "input": text}
+            #payload = {"model": "text-embedding-3-small", "input": text}
+            payload = {"model": "text-embedding-3-large", "input": text}
             r = requests.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT_SHORT)
             r.raise_for_status()
             data = r.json()
@@ -324,17 +333,18 @@ def _call_llm_summarize(question: str, quotes: List[Dict[str, str]], compact: bo
     trechos_block = "\n\n".join(trechos_list)
 
     system = (
-        "Você é um assistente ESTRITAMENTE EXTRATIVO.\n"
+        "Você é um assistente de IA focado em responder perguntas usando documentos de referência.\n"
         "Siga TODAS as instruções abaixo com muito rigor:\n\n"
-        "1) Use SOMENTE as informações contidas nos trechos fornecidos.\n"
-        "2) É PROIBIDO usar conhecimento externo, completar lacunas, inferir fatos ou generalizar.\n"
-        #"3) Se os trechos não trouxerem informação suficiente para responder à pergunta,\n"
-        #"   responda APENAS o texto exato: NAO_ENCONTRADO.\n"
-        "3) Tente responder a pergunta da melhor forma possível usando os trechos. Se os trechos não ajudarem, explique que não encontrou a informação específica.\n"
-        "4) Não repita a pergunta, não peça desculpas e não invente dados.\n"
-        "5) Responda em português claro e objetivo.\n"
+        "1) Baseie sua resposta **EXCLUSIVAMENTE** nas informações dos trechos fornecidos.\n"
+        "2) É PROIBIDO **inventar** fatos ou usar conhecimento externo que não esteja nos trechos.\n"
+        "3) **PERMITIDO FAZER CONEXÕES:** Você **DEVE** conectar o sentido da pergunta com o sentido dos trechos. Por exemplo, se a pergunta é 'quem autoriza' e o texto diz 'cabe ao CEPLAE deliberar', você deve entender que 'deliberar' é a resposta para 'autorizar'. O mesmo vale para 'fluxo de solicitação' e 'manifestação'.\n"
+        "4) **REGRA DE NEGÓCIO (RISCO vs EMERGÊNCIA):** Se a pergunta for sobre um *risco* (ex: 'trinca', 'pode cair', 'parece que vai cair'), use a definição de 'Manutenção de Risco'. Se a pergunta for sobre um *evento que já ocorreu* (ex: 'caiu', 'desabou'), use a definição de 'Emergência' ou 'Queda de Muro'.\n"
+        "5) Tente responder a pergunta da melhor forma possível usando os trechos. Se os trechos forem irrelevantes ou realmente não contiverem a resposta (mesmo após tentar fazer as conexões de sentido da regra #3), explique que não encontrou a informação específica nos documentos.\n"
+        "6) Não repita a pergunta, não peça desculpas.\n"
+        "7) Responda em português claro e objetivo.\n"
     )
 
+    # --- CORREÇÃO 2: Removida a regra contraditória "NAO_ENCONTRADO" ---
     user = (
         f"Pergunta do usuário:\n"
         f"{question}\n\n"
@@ -344,8 +354,6 @@ def _call_llm_summarize(question: str, quotes: List[Dict[str, str]], compact: bo
         "- Se os trechos trazem a informação necessária, escreva uma resposta direta e concisa,\n"
         "  em 1 ou 2 parágrafos curtos, explicando o que a pergunta pede.\n"
         "- Não acrescente nada que não esteja claramente suportado pelos trechos.\n"
-        "- Se realmente não houver informação suficiente para responder, responda apenas:\n"
-        "  NAO_ENCONTRADO\n"
     )
 
     _, _, ans = _call_api_with_messages(
@@ -450,7 +458,7 @@ def _text_search(query: str, topk: int, semantic_config: str,search_index: str, 
     if semantic_on:
         base_payload.update({
             "queryType": "semantic",
-            "queryLanguage": "pt-BR",
+            #"queryLanguage": "pt-BR",
             "answers": "extractive",
             "answersCount": 1,
             "captions": "extractive",
@@ -483,7 +491,9 @@ def _text_search(query: str, topk: int, semantic_config: str,search_index: str, 
 def _normalize_hit(h: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": h.get("id"),
-        "score": h.get("@search.score"),
+        #"score": h.get("@search.score"),
+        #"score": (h.get("@search.rerankerScore") / 4.0) if h.get("@search.rerankerScore") else h.get("@search.score"),
+        "score": (h.get("@search.rerankerScore") / 4.0) if h.get("@search.rerankerScore") else (h.get("@search.vectorSearchScore") or h.get("@search.score")),
         "text": _clean_text(h.get("text") or ""),
         "source_file": h.get("source_file"),
         "id_original": h.get("id_original"),
@@ -955,6 +965,12 @@ def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
     topk    = int((body or {}).get("topK") or DEFAULT_TOPK)
     compact = bool((body or {}).get("compact", False))
 
+    # --- NOVO AJUSTE DE REGRA DE NEGÓCIO (Forçar Emergência) ---
+    query_lower = query.lower()
+    if ("preso" in query_lower or "trancado" or "quebrou" in query_lower) and "elevador" in query_lower:
+        logging.info("Regra de negócio: Forçando 'emergência' para consulta de elevador preso.")
+        query = query + " emergência risco"
+    
     # NOVAS LINHAS: Pega os valores do body (com um fallback seguro)
     # Note que não usamos mais COG_SEARCH_INDEX ou COG_SEARCH_SEM_CONFIG global
     req_index    = (body or {}).get("search_index") or COG_SEARCH_INDEX
@@ -1100,7 +1116,7 @@ def handle_search_request(body: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "status": "ok",
-        "versao":"v1.01",
+        "versao":"v1.06",
         "query": query,
         "result": result
     }
@@ -1117,6 +1133,42 @@ def _is_short_def_query(query: str) -> bool:
     ):
         return True
     return False
+
+# --- FUNÇÃO 1: A NOVA (Busca / RAG) ---
+@app.function_name(name="search_obras")
+@app.route(route="search_obras", auth_level=func.AuthLevel.ANONYMOUS)
+def http_search_trigger(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Recebendo requisição de busca.')
+    
+    try:
+        # 1. Parse do Body
+        try:
+            body = req.get_json()
+        except ValueError:
+            return func.HttpResponse(
+                json.dumps({"error": "Invalid JSON body"}, ensure_ascii=False),
+                mimetype="application/json",
+                status_code=400
+            )
+
+        # 2. CHAMADA DA LÓGICA PRINCIPAL
+        # Aqui conectamos o HTTP Trigger com o seu script de RAG
+        result = handle_search_request(body)
+
+        # 3. Retorno
+        return func.HttpResponse(
+            json.dumps(result, ensure_ascii=False),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    except Exception as e:
+        logging.exception(f"Erro crítico na function: {e}")
+        return func.HttpResponse(
+            json.dumps({"error": f"Erro interno: {str(e)}"}, ensure_ascii=False),
+            mimetype="application/json",
+            status_code=500
+        )
 
 # ---------------------------------------------------------------------
 # Execução local
